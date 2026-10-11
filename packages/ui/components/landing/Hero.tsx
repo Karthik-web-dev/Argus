@@ -9,5 +9,5 @@ function RunWindow() {
 }
 export function Hero() {
   const c = landingCopy.hero;
-  return <section className="hero wrap" id="top"><div className="hero-copy"><h1>{c.title}</h1><div className="hero-subrow"><p>{c.description}</p><div className="hero-actions"><Link className="button button-cream" href="#benchmark">{c.scan} <span>→</span></Link><Link className="button button-outline" href="#benchmark">{c.benchmark}</Link></div></div></div><div className="hero-stage"><Image src="/images/hero-bg.webp" alt="Original dithered purple and indigo hills with a bright lime path" fill priority sizes="(max-width: 768px) 100vw, 1236px" className="cover-img"/><RunWindow/></div></section>;
+  return <section className="hero wrap" id="top"><div className="hero-copy"><h1>{c.title}</h1><div className="hero-subrow"><p>{c.description}</p><div className="hero-actions"><Link className="button button-cream" href="/dashboard">{c.scan} <span>→</span></Link><Link className="button button-outline" href="#benchmark">{c.benchmark}</Link></div></div></div><div className="hero-stage"><Image src="/images/hero-bg.webp" alt="Original dithered purple and indigo hills with a bright lime path" fill priority sizes="(max-width: 768px) 100vw, 1236px" className="cover-img"/><RunWindow/></div></section>;
 }
