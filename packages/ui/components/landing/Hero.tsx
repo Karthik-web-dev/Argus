@@ -1,0 +1,13 @@
+import Image from "next/image";
+import Link from "next/link";
+import { landingCopy, runMessages, sidebarItems } from "@/lib/landing-content";
+
+function DockIcon({ kind }: { kind: string }) { return <span className={`dock-icon dock-${kind}`} aria-hidden="true">{kind === "browser" ? "◉" : kind === "terminal" ? "›_" : kind === "notes" ? "▤" : kind === "git" ? "⌘" : "⠿"}</span>; }
+function RunWindow() {
+  const c = landingCopy.hero;
+  return <div className="run-window"><div className="window-bar"><span className="app-mark">A</span><span>{c.windowTitle}</span><div className="window-actions"><i /><i /><i /></div></div><div className="run-body"><aside className="run-sidebar"><strong>{c.workspace}</strong>{sidebarItems.map((item, i) => <div className={`side-item ${i === 0 ? "selected" : ""}`} key={item}><span className="side-glyph">{["⌕", "◷", "◇", "◉", "⇧"][i]}</span>{item}</div>)}<small>{c.agentsLabel}</small>{c.agentNames.map((name,i)=><div className={`agent-state ${i===2?"idle":""}`} key={name}><b />{name}</div>)}</aside><section className="run-main"><div className="channel-head"><strong>{c.liveChannel}</strong><span>{c.findingCount}</span><span className="live-tag"><b /> LIVE</span></div><div className="messages">{runMessages.map((message) => <article className="message" key={message.name}><span className={`avatar ${message.tint}`}>{message.initials}</span><div><div className="message-meta"><strong>{message.name}</strong><time>{message.time}</time></div><p>{message.body}</p></div></article>)}</div><div className="composer"><small>{c.sampleData}</small>{c.scoreboard}<span className="caret" /></div></section></div><div className="agent-cursor"><span className="cursor-arrow">➤</span><span>{c.cursorLabel}</span></div><div className="dock"><DockIcon kind="files"/><DockIcon kind="browser"/><DockIcon kind="terminal"/><DockIcon kind="notes"/><DockIcon kind="git"/><DockIcon kind="grid"/></div></div>;
+}
+export function Hero() {
+  const c = landingCopy.hero;
+  return <section className="hero wrap" id="top"><div className="hero-copy"><h1>{c.title}</h1><div className="hero-subrow"><p>{c.description}</p><div className="hero-actions"><Link className="button button-cream" href="#benchmark">{c.scan} <span>→</span></Link><Link className="button button-outline" href="#benchmark">{c.benchmark}</Link></div></div></div><div className="hero-stage"><Image src="/images/hero-bg.webp" alt="Original dithered purple and indigo hills with a bright lime path" fill priority sizes="(max-width: 768px) 100vw, 1236px" className="cover-img"/><RunWindow/></div></section>;
+}
