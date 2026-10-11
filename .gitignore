@@ -1,0 +1,8 @@
+node_modules
+.next
+**/.next
+out
+dist
+.pnpm-store
+docs/landing-qa/reference-slice-*.png
+.DS_Store
