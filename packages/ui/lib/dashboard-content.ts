@@ -10,6 +10,10 @@ export type Finding = {
   actual: string;
   network: { method: string; path: string; status: string; duration: string };
   console: string;
+  /** Real Evidence Gate replay result, e.g. "Reproduced 3/3 in fresh contexts". */
+  repro?: string;
+  /** "none" until the Red Team independently confirms the finding. */
+  verifiedBy?: "red_team" | "none";
 };
 
 export const demoFindings: Finding[] = [

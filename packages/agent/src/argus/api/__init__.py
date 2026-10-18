@@ -27,9 +27,12 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from argus.api.screencast import ScreencastHub
+from argus.cancellation import RunCancelled
+from argus.cancellation import cancel as cancel_run_flag
+from argus.cancellation import clear as clear_cancellation
 from argus.config import settings
 from argus.graph.build import run_supervisor
 from argus.run_store import RunStore
@@ -54,7 +57,7 @@ app.add_middleware(
         "http://localhost:4173",
         "http://127.0.0.1:4173",
     ],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "Authorization", "Last-Event-ID"],
 )
 
@@ -158,6 +161,13 @@ class RunService:
                     run_graph,
                 )
             self.store.update(run_id, status="completed")
+        except RunCancelled:
+            logger.info("Run %s stopped by user", run_id)
+            RunArtifactLayout(self.store.runs_root, run_id).append_event(RunEvent(
+                id=uuid4().hex, run_id=run_id, agent="api", correlation_id=run_id,
+                type="run_cancelled", payload={"message": "Run stopped by user"},
+            ))
+            self.store.update(run_id, status="cancelled", error="Stopped by user")
         except Exception as exc:
             logger.exception("Run %s failed", run_id)
             layout = RunArtifactLayout(self.store.runs_root, run_id)
@@ -173,6 +183,7 @@ class RunService:
             )
             self.store.update(run_id, status="failed", error=str(exc))
         finally:
+            clear_cancellation(run_id)
             self.screencasts[run_id].close()
 
 
@@ -281,6 +292,55 @@ async def get_run(run_id: str) -> dict[str, Any]:
             status_code=500, detail="Run state is invalid JSON"
         ) from exc
     return {**_public_run(row), "summary": summary, "artifacts": _artifact_urls(run_id)}
+
+
+@app.get("/runs/{run_id}/report.pdf", dependencies=[Depends(require_api_token)])
+async def get_report_pdf(run_id: str) -> FileResponse:
+    """Serve the run's bug report PDF, rendering it from bug_reports.json if needed."""
+    from argus_contracts.models import BugReport
+
+    from argus.reporter.document import build_report_html, render_pdf
+
+    row = run_service.store.get(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    reports_dir = run_service.store.runs_root / run_id / "reports"
+    pdf_path = reports_dir / "bug_report.pdf"
+    source = reports_dir / "bug_reports.json"
+    if not source.is_file():
+        raise HTTPException(status_code=409, detail="This run has not filed its reports yet")
+    # Re-render on every download (about a second) so report wording improvements
+    # also apply to runs that finished earlier.
+    reports = [BugReport.model_validate(item) for item in json.loads(source.read_text(encoding="utf-8"))]
+    html_source = build_report_html(reports, target_url=row["target_url"], run_id=run_id)
+    (reports_dir / "bug_report.html").write_text(html_source, encoding="utf-8")
+    await render_pdf(html_source, pdf_path)
+    return FileResponse(pdf_path, media_type="application/pdf",
+                        filename=f"argus-bug-report-{run_id[:8]}.pdf")
+
+
+@app.post("/runs/{run_id}/cancel", status_code=202, dependencies=[Depends(require_api_token)])
+async def cancel_run(run_id: str) -> dict[str, str]:
+    row = run_service.store.get(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if row["status"] not in {"queued", "running"}:
+        return {"run_id": run_id, "status": row["status"]}
+    # The pipeline stops at its next checkpoint (next step, case or phase).
+    cancel_run_flag(run_id)
+    return {"run_id": run_id, "status": "cancelling"}
+
+
+@app.delete("/runs/{run_id}", status_code=204, dependencies=[Depends(require_api_token)])
+async def delete_run(run_id: str) -> Response:
+    if run_service.store.get(run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    task = run_service._tasks.get(run_id)
+    if task is not None:
+        cancel_run_flag(run_id)
+        task.cancel()
+    run_service.store.delete(run_id)
+    return Response(status_code=204)
 
 
 @app.get("/runs/{run_id}/artifacts", dependencies=[Depends(require_api_token)])

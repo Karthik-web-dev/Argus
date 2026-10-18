@@ -7,7 +7,7 @@ import { LiveView } from "@/components/live-view";
 
 interface DashboardRun { id: string; name: string; score: string; time: string; status: string; coverage: string; url: string; spec: string }
 interface ApiRun { run_id: string; target_url: string; spec: string; status: string; created_at: string }
-interface ApiBug { id: string; severity: "P0" | Finding["severity"]; title: string; expected: string; actual: string; steps?: Array<{action: string; locator?: string; value?: string}>; evidence?: {network?: Array<{url: string; method?: string; status?: number | null}>; console?: Array<{message: string}>} }
+interface ApiBug { id: string; severity: "P0" | Finding["severity"]; title: string; expected: string; actual: string; steps?: Array<{action: string; locator?: string; value?: string}>; evidence?: {network?: Array<{url: string; method?: string; status?: number | null}>; console?: Array<{message: string}>; reproduction?: {attempts: number; successes: number}}; verified_by?: "red_team" | "none" }
 interface ApiTestCase { id: string; journey: string; category?: string }
 interface ApiTestResult { test_id: string; verdict: "PASS" | "FAIL" | "INCONCLUSIVE"; duration_ms: number }
 interface ApiArtifact { path: string; url: string }
@@ -34,9 +34,36 @@ function enrichRun(run: ApiRunDetail): DashboardRun {
   return { ...asRun(run), score: journeys ? `${findings}/${journeys}` : String(findings), coverage: coveragePercent == null ? "—" : `${coveragePercent}%` };
 }
 
+interface LiveFindingPayload { id: string; oracle_id?: string; expected?: string; actual?: string; steps?: ApiBug["steps"] }
+
+/** Severity for an unreported finding, inferred from the oracle that raised it. */
+function liveSeverity(payload: LiveFindingPayload): Finding["severity"] {
+  if (payload.oracle_id === "http-status") return /HTTP 5\d\d/.test(payload.actual ?? "") ? "P1" : "P2";
+  return payload.oracle_id === "spec-assertion" ? "P2" : "P3";
+}
+
+/** Map a streamed finding_created payload (a Finding, not yet a BugReport) for display. */
+function asLiveFinding(payload: LiveFindingPayload, gate: string | undefined, time: string): Finding {
+  const oracle = payload.oracle_id ?? "finding";
+  const actual = payload.actual || "See evidence";
+  return {
+    id: payload.id, severity: liveSeverity(payload), title: actual.slice(0, 90),
+    status: gate === "ACCEPTED" ? "verified" : gate === "REJECTED" || gate === "FLAKY" ? "rejected" : "pending",
+    time, detail: actual, verifiedBy: "none",
+    repro: gate === "ACCEPTED" ? "Reproduced by the Evidence Gate" : gate ? `Evidence Gate: ${gate.toLowerCase()}` : "Waiting for the Evidence Gate",
+    steps: (payload.steps ?? []).map((step) => `${step.action}${step.locator ? ` ${step.locator}` : ""}${step.value ? `: ${step.value}` : ""}`),
+    expected: payload.expected || "—", actual,
+    network: { method: "—", path: oracle, status: "—", duration: "—" },
+    console: oracle === "console-error" ? actual : "",
+  };
+}
+
 function asFinding(bug: ApiBug): Finding {
   const network = bug.evidence?.network?.[0];
-  return { id: bug.id, severity: bug.severity, title: bug.title, status: "verified", time: "Live run", detail: bug.actual || bug.title,
+  const reproduction = bug.evidence?.reproduction;
+  return { id: bug.id, severity: bug.severity, title: bug.title, status: "verified", time: "Live run",
+    verifiedBy: bug.verified_by ?? "none",
+    repro: reproduction?.attempts ? `Reproduced ${reproduction.successes}/${reproduction.attempts} in fresh contexts` : "Accepted by the Evidence Gate", detail: bug.actual || bug.title,
     steps: (bug.steps ?? []).map((step) => `${step.action}${step.locator ? ` ${step.locator}` : ""}${step.value ? `: ${step.value}` : ""}`),
     expected: bug.expected, actual: bug.actual, network: { method: network?.method ?? "—", path: network ? new URL(network.url, window.location.href).pathname : "No network evidence", status: network?.status == null ? "—" : String(network.status), duration: "—" }, console: bug.evidence?.console?.map((item) => item.message).join("\n") || "No console errors recorded." };
 }
@@ -76,6 +103,9 @@ function Brand() { return <a className="dashboard-brand" href="/" aria-label="Ar
 export function Workspace() {
   const [screen, setScreen] = useState<Screen>("history");
   const [runs, setRuns] = useState<DashboardRun[]>([]);
+  const [runMenu, setRunMenu] = useState<{ id: string; confirming: boolean } | null>(null);
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [selectedRun, setSelectedRun] = useState<DashboardRun | null>(null);
   const [selectedFinding, setSelectedFinding] = useState<Finding>(emptyFinding);
   const [url, setUrl] = useState("");
@@ -95,10 +125,28 @@ export function Workspace() {
   const workspaceRef = useRef<HTMLDivElement>(null);
   const splitRef = useRef<HTMLDivElement>(null);
   const running = screen === "running";
+  // Findings streamed during the run, updated with Evidence Gate verdicts as they arrive.
+  const liveFindings = useMemo(() => {
+    const gates = new Map<string, string>();
+    const created = new Map<string, { payload: LiveFindingPayload; ts?: string }>();
+    for (const event of stream.events) {
+      const payload = event.payload ?? {};
+      if (event.type === "finding_created" && typeof payload.id === "string") {
+        created.set(payload.id, { payload: payload as unknown as LiveFindingPayload, ts: event.ts });
+      } else if (event.type === "gate_result" && typeof payload.finding_id === "string" && typeof payload.verdict === "string") {
+        gates.set(payload.finding_id, payload.verdict.toUpperCase());
+      }
+    }
+    return [...created.values()].reverse().map(({ payload, ts }) =>
+      asLiveFinding(payload, gates.get(payload.id), ts ? new Date(ts).toLocaleTimeString() : "Live run"));
+  }, [stream.events]);
   const visibleFindings = useMemo(() => {
-    const bugs = runDetail?.summary?.bugs_found ?? runDetail?.summary?.findings ?? [];
-    return bugs.length ? bugs.map(asFinding) : activeRunId ? [] : demoFindings;
-  }, [runDetail, activeRunId]);
+    // Filed bug reports win; otherwise show the streamed findings so a run is never blank.
+    const bugs = runDetail?.summary?.bugs_found ?? [];
+    if (bugs.length) return bugs.map(asFinding);
+    if (liveFindings.length) return liveFindings;
+    return activeRunId ? [] : demoFindings;
+  }, [runDetail, activeRunId, liveFindings]);
   const findingArtifacts = selectedFinding.id === "f-01" ? evidenceFiles : [`${selectedFinding.id}-replay.png`, `${selectedFinding.id}-network.json`, `${selectedFinding.id}-console.txt`, `${selectedFinding.id}-repro.spec.ts`];
 
   const refreshRuns = useCallback(async () => {
@@ -135,7 +183,8 @@ export function Workspace() {
   }, [activeRunId, stream.status]);
 
   useEffect(() => {
-    if (runDetail?.status === "completed" || runDetail?.status === "failed") {
+    if (runDetail?.status === "completed" || runDetail?.status === "failed" || runDetail?.status === "cancelled") {
+      setStopping(false);
       setScreen("results");
       void refreshRuns();
     }
@@ -187,6 +236,50 @@ export function Workspace() {
     }
   }
 
+  useEffect(() => {
+    if (!runMenu) return;
+    const close = (event: Event) => {
+      if (event instanceof KeyboardEvent && event.key !== "Escape") return;
+      if (event.target instanceof Element && event.target.closest(".run-menu, .run-more")) return;
+      setRunMenu(null);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", close);
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", close); };
+  }, [runMenu]);
+
+  async function stopRun() {
+    if (!activeRunId || stopping) return;
+    setStopping(true);
+    try {
+      const response = await fetch(`${argusApiUrl}/runs/${encodeURIComponent(activeRunId)}/cancel`, { method: "POST", headers: apiHeaders() });
+      if (!response.ok) throw new Error(`Could not stop the run (${response.status}).`);
+    } catch (error) {
+      setStopping(false);
+      setApiError(error instanceof Error ? error.message : "Unable to stop this run.");
+    }
+  }
+
+  async function deleteRun(run: DashboardRun) {
+    setDeletingRunId(run.id);
+    try {
+      const response = await fetch(`${argusApiUrl}/runs/${encodeURIComponent(run.id)}`, { method: "DELETE", headers: apiHeaders() });
+      if (!response.ok && response.status !== 404) throw new Error(`Could not delete run (${response.status}).`);
+      setRuns((current) => current.filter((item) => item.id !== run.id));
+      if (selectedRun?.id === run.id || activeRunId === run.id) {
+        setSelectedRun(null);
+        setActiveRunId(null);
+        setRunDetail(null);
+        setScreen("history");
+      }
+      setRunMenu(null);
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "Unable to delete this run.");
+    } finally {
+      setDeletingRunId(null);
+    }
+  }
+
   async function chooseRun(run: DashboardRun) {
     setSelectedRun(run);
     setActiveRunId(run.id);
@@ -210,6 +303,27 @@ export function Workspace() {
     else setTopSplit((value) => Math.max(42, Math.min(82, value + delta)));
   }
 
+  const [downloading, setDownloading] = useState(false);
+
+  async function downloadReport() {
+    if (!activeRunId) { void copyReport(); return; }
+    setDownloading(true);
+    try {
+      const response = await fetch(`${argusApiUrl}/runs/${encodeURIComponent(activeRunId)}/report.pdf`, { headers: apiHeaders() });
+      if (!response.ok) throw new Error(response.status === 409 ? "The bug report is not ready yet." : `Could not download the report (${response.status}).`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `argus-bug-report-${activeRunId.slice(0, 8)}.pdf`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "Unable to download the report.");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
   async function copyReport() {
     const report = `${selectedFinding.severity} ${selectedFinding.title}\n\n${selectedFinding.detail}\n\nExpected: ${selectedFinding.expected}\nActual: ${selectedFinding.actual}`;
     try { await navigator.clipboard.writeText(report); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }
@@ -223,17 +337,29 @@ export function Workspace() {
     <header className="dashboard-topbar"><Brand/><div className="topbar-run-context">
       {screen === "history" && <span className="topbar-muted">Workspace <b>/</b> Runs</span>}
       {screen === "entry" && <span className="topbar-muted">Workspace <b>/</b> New run</span>}
-      {(isLive || isResults) && <><button className="spec-toggle" onClick={() => setScreen("entry")} title="Edit run specification">{isLive ? "Spec: " + (selectedRun?.spec || spec).slice(0, 36) : `${selectedRun?.name ?? "Run"} · ${selectedRun?.time ?? ""}`} <span>⌄</span></button><span className={`run-state ${isLive ? "is-running" : "is-complete"}`}><StatusDot tone={isLive ? "amber" : "green"}/>{isLive ? stream.status === "failed" ? "FAILED" : stream.status === "completed" ? "COMPLETE" : "RUNNING" : "COMPLETE"}</span><span className="run-timer">{isLive ? `00:${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}` : ""}</span></>}
+      {(isLive || isResults) && <><button className="spec-toggle" onClick={() => setScreen("entry")} title="Edit run specification">{isLive ? "Spec: " + (selectedRun?.spec || spec).slice(0, 36) : `${selectedRun?.name ?? "Run"} · ${selectedRun?.time ?? ""}`} <span>⌄</span></button><span className={`run-state ${isLive ? "is-running" : "is-complete"}`}><StatusDot tone={isLive ? "amber" : "green"}/>{isLive ? stream.status === "failed" ? (stream.error === "Run stopped by user." ? "STOPPED" : "FAILED") : stream.status === "completed" ? "COMPLETE" : "RUNNING" : "COMPLETE"}</span><span className="run-timer">{isLive ? `00:${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}` : ""}</span></>}
     </div><div className="topbar-actions">
+      {isLive && activeRunId && stream.status !== "completed" && stream.status !== "failed" && <button className="button button-stop button-small" onClick={() => void stopRun()} disabled={stopping} title="Stop the run at its next checkpoint">{stopping ? "Stopping…" : "■ Stop run"}</button>}
       {isLive && <button className="button button-outline button-small" onClick={() => { setFullScreen(false); setScreen("results"); }}>View report</button>}
-      {isResults && <><button className="button button-outline button-small" onClick={() => setScreen("entry")}>↻ Re-run</button><button className="button button-cream button-small" onClick={() => void copyReport()}>↓ {copied ? "Copied" : "Export"}</button></>}
+      {isResults && <><button className="button button-outline button-small" onClick={() => setScreen("entry")}>↻ Re-run</button><button className="button button-cream button-small" onClick={() => void downloadReport()} disabled={downloading}>{activeRunId ? (downloading ? "Preparing PDF…" : "↓ Bug report (PDF)") : `↓ ${copied ? "Copied" : "Export"}`}</button></>}
       <a className="topbar-home" href="/">Landing page <span>↗</span></a>
     </div></header>
 
     <aside className="dashboard-rail">
       <button className={`new-run-button ${screen === "entry" ? "active" : ""}`} onClick={() => setScreen("entry")}><span>＋</span> New Run <kbd>N</kbd></button>
-      <div className="rail-label">Recent runs <span>···</span></div>
-      <div className="run-list">{runs.map((run) => <button key={run.id} className={`run-list-item ${selectedRun?.id === run.id && (isResults || isLive) ? "active" : ""}`} onClick={() => void chooseRun(run)}><span className="run-item-top"><StatusDot tone={run.status === "failed" ? "amber" : "green"}/><strong>{run.name}</strong><span className="run-more">···</span></span><span className="run-item-score">{run.status}</span><span className="run-item-time">{run.time}</span></button>)}</div>
+      <div className="rail-label">Recent runs <span>{runs.length}</span></div>
+      <div className="run-list">{runs.map((run) => {
+        const menuOpen = runMenu?.id === run.id;
+        return <div key={run.id} className={`run-list-row ${menuOpen ? "menu-open" : ""}`}>
+          <button className={`run-list-item ${selectedRun?.id === run.id && (isResults || isLive) ? "active" : ""}`} onClick={() => void chooseRun(run)}><span className="run-item-top"><StatusDot tone={run.status === "failed" ? "amber" : "green"}/><strong>{run.name}</strong></span><span className="run-item-score">{run.status}</span><span className="run-item-time">{run.time}</span></button>
+          <button className="run-more" aria-label={`Options for ${run.name}`} aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setRunMenu(menuOpen ? null : { id: run.id, confirming: false })}>···</button>
+          {menuOpen && <div className="run-menu" role="menu">
+            {runMenu.confirming
+              ? <><p>Delete this run and its artifacts?</p><div className="run-menu-actions"><button onClick={() => setRunMenu({ id: run.id, confirming: false })}>Cancel</button><button className="danger" disabled={deletingRunId === run.id} onClick={() => void deleteRun(run)}>{deletingRunId === run.id ? "Deleting…" : "Delete"}</button></div></>
+              : <button role="menuitem" className="danger" onClick={() => setRunMenu({ id: run.id, confirming: true })}>Delete run</button>}
+          </div>}
+        </div>;
+      })}</div>
       <div className="rail-bottom"><span className="avatar-small">P</span><span><strong>Parth</strong><small>Personal workspace</small></span><button aria-label="Workspace settings">⌄</button></div>
     </aside>
 
@@ -249,7 +375,7 @@ export function Workspace() {
 
         <div ref={workspaceRef} className={`workspace-layout ${isResults ? "results-layout" : ""}`} style={{ gridTemplateRows: fullScreen ? "minmax(0, 1fr)" : `${topSplit}fr 10px ${100 - topSplit}fr` }}>
           <div ref={splitRef} className={`workspace-top ${fullScreen ? "is-fullscreen" : ""}`} style={{ gridTemplateColumns: fullScreen ? "1fr" : `${browserSplit}fr 10px ${100 - browserSplit}fr` }}>
-            {isLive ? <section className="browser-panel"><div className="panel-heading"><div><span className="panel-icon">◉</span><strong>Live browser</strong><span className="live-label"><StatusDot tone={stream.status === "failed" ? "gray" : stream.status === "completed" ? "green" : "amber"}/> {stream.status === "failed" ? "Run failed" : stream.status === "completed" ? "Run complete" : "Agent is working"}</span></div><div className="panel-controls"><button onClick={() => setFullScreen((value) => !value)} title={fullScreen ? "Exit fullscreen" : "Fullscreen browser"}>{fullScreen ? "⊠" : "⛶"}</button>{fullScreen && <button onClick={() => setFullScreen(false)} title="Exit fullscreen">×</button>}</div></div><div className="browser-frame-live"><LiveView runId={activeRunId ?? ""} fixtureSrc={runMode === "fixture" ? "/fixtures/fixture-browser-frame.svg" : undefined} /></div><div className="browser-actions"><button className="text-action" onClick={() => setFullScreen(true)}>⛶ Expand browser</button><button className="text-action" onClick={() => setScreen("results")}>View report →</button></div>{fullScreen && <div className="floating-score-wrap" onMouseEnter={() => setScoreOpen(true)} onMouseLeave={() => setScoreOpen(false)}><button className="floating-score" aria-expanded={scoreOpen} aria-label="Open findings and scoreboard" onClick={() => setScoreOpen((value) => !value)}><strong>{visibleFindings.length}</strong><span>findings</span><b>{stream.events.length} events</b><i>{runDetail?.summary?.coverage ? `${Math.round(Object.values(runDetail.summary.coverage).reduce((a, b) => a + b, 0) / Object.keys(runDetail.summary.coverage).length * 100)}%` : "—"}</i></button>{scoreOpen && <div className="floating-findings"><div className="subpanel-heading"><strong>Findings feed</strong><span>{visibleFindings.length} findings · {stream.events.length} events</span></div><div className="finding-list">{visibleFindings.slice(0, 4).map((finding) => <FindingRow key={finding.id} finding={finding} active={selectedFinding.id === finding.id} onClick={() => setSelectedFinding(finding)}/>)}</div><button className="text-action" onClick={() => { setFullScreen(false); setScreen("results"); }}>Open full report →</button></div>}</div>}</section> : <section className="evidence-panel"><div className="panel-heading"><div><span className="panel-icon evidence-icon">✦</span><strong>Evidence</strong><span className="sample-tag">Selected finding</span></div><button className="panel-more" onClick={() => void copyReport()}>{copied ? "Copied ✓" : "⋯"}</button></div><div className="evidence-content"><div className="evidence-kicker"><span className={`severity ${selectedFinding.severity.toLowerCase()}`}>{selectedFinding.severity}</span><span>{selectedFinding.status === "verified" ? "VERIFIED FINDING" : selectedFinding.status === "pending" ? "PENDING REVIEW" : "REJECTED REPORT"}</span><span className="evidence-time">{selectedFinding.time}</span></div><h2>{selectedFinding.detail}</h2><p className="repro-count"><StatusDot tone={selectedFinding.status === "verified" ? "green" : selectedFinding.status === "pending" ? "amber" : "gray"}/> {selectedFinding.status === "verified" ? "Reproduced 5/5 in fresh contexts" : selectedFinding.status === "pending" ? "Replaying in fresh contexts" : "Rejected after fresh replay"}</p><div className="evidence-section"><h3>STEPS TO REPRODUCE</h3><ol>{selectedFinding.steps.map((step, i) => <li key={step}><span>{String(i + 1).padStart(2, "0")}</span>{step}</li>)}</ol></div><div className="expected-actual"><div><h3>EXPECTED</h3><p>{selectedFinding.expected}</p></div><div><h3>ACTUAL</h3><p>{selectedFinding.actual}</p></div></div><div className="evidence-section trace-section"><h3>NETWORK TRACE <span>{selectedFinding.network.method} {selectedFinding.network.path}</span></h3><div className="trace-line"><code>{selectedFinding.network.method}</code><span>{selectedFinding.network.path}</span><b className={selectedFinding.network.status.startsWith("5") ? "trace-error" : "trace-ok"}>{selectedFinding.network.status}</b><small>{selectedFinding.network.duration}</small></div><h3>CONSOLE</h3><pre>{selectedFinding.console}</pre></div><div className="artifact-row"><h3>ARTIFACTS</h3>{findingArtifacts.map((file, i) => <button key={file} onClick={() => setCopied(true)}><span>{["▧", "⌁", "≋", "‹›"][i]}</span>{file}<i>↗</i></button>)}</div><div className="evidence-actions"><button className="button button-outline button-small" onClick={() => void copyReport()}>{copied ? "Copied ✓" : "Copy report"}</button><button className="button button-cream button-small" onClick={() => setScreen("entry")}>Start new run →</button></div></div></section>}
+            {isLive ? <section className="browser-panel"><div className="panel-heading"><div><span className="panel-icon">◉</span><strong>Live browser</strong><span className="live-label"><StatusDot tone={stream.status === "failed" ? "gray" : stream.status === "completed" ? "green" : "amber"}/> {stream.status === "failed" ? "Run failed" : stream.status === "completed" ? "Run complete" : "Agent is working"}</span></div><div className="panel-controls"><button onClick={() => setFullScreen((value) => !value)} title={fullScreen ? "Exit fullscreen" : "Fullscreen browser"}>{fullScreen ? "⊠" : "⛶"}</button>{fullScreen && <button onClick={() => setFullScreen(false)} title="Exit fullscreen">×</button>}</div></div><div className="browser-frame-live"><LiveView runId={activeRunId ?? ""} fixtureSrc={runMode === "fixture" ? "/fixtures/fixture-browser-frame.svg" : undefined} /></div><div className="browser-actions"><button className="text-action" onClick={() => setFullScreen(true)}>⛶ Expand browser</button><button className="text-action" onClick={() => setScreen("results")}>View report →</button></div>{fullScreen && <div className="floating-score-wrap" onMouseEnter={() => setScoreOpen(true)} onMouseLeave={() => setScoreOpen(false)}><button className="floating-score" aria-expanded={scoreOpen} aria-label="Open findings and scoreboard" onClick={() => setScoreOpen((value) => !value)}><strong>{visibleFindings.length}</strong><span>findings</span><b>{stream.events.length} events</b><i>{runDetail?.summary?.coverage ? `${Math.round(Object.values(runDetail.summary.coverage).reduce((a, b) => a + b, 0) / Object.keys(runDetail.summary.coverage).length * 100)}%` : "—"}</i></button>{scoreOpen && <div className="floating-findings"><div className="subpanel-heading"><strong>Findings feed</strong><span>{visibleFindings.length} findings · {stream.events.length} events</span></div><div className="finding-list">{visibleFindings.slice(0, 4).map((finding) => <FindingRow key={finding.id} finding={finding} active={selectedFinding.id === finding.id} onClick={() => setSelectedFinding(finding)}/>)}</div><button className="text-action" onClick={() => { setFullScreen(false); setScreen("results"); }}>Open full report →</button></div>}</div>}</section> : <section className="evidence-panel"><div className="panel-heading"><div><span className="panel-icon evidence-icon">✦</span><strong>Evidence</strong><span className="sample-tag">Selected finding</span></div><button className="panel-more" onClick={() => void copyReport()}>{copied ? "Copied ✓" : "⋯"}</button></div><div className="evidence-content"><div className="evidence-kicker"><span className={`severity ${selectedFinding.severity.toLowerCase()}`}>{selectedFinding.severity}</span><span>{selectedFinding.status === "verified" ? (selectedFinding.verifiedBy === "none" ? "REPRODUCED FINDING" : "VERIFIED FINDING") : selectedFinding.status === "pending" ? "PENDING REVIEW" : "REJECTED REPORT"}</span><span className="evidence-time">{selectedFinding.time}</span></div><h2>{selectedFinding.detail}</h2><p className="repro-count"><StatusDot tone={selectedFinding.status === "verified" ? "green" : selectedFinding.status === "pending" ? "amber" : "gray"}/> {selectedFinding.status === "verified" ? (selectedFinding.repro ?? "Reproduced 5/5 in fresh contexts") : selectedFinding.status === "pending" ? "Replaying in fresh contexts" : "Rejected after fresh replay"}</p><div className="evidence-section"><h3>STEPS TO REPRODUCE</h3><ol>{selectedFinding.steps.map((step, i) => <li key={step}><span>{String(i + 1).padStart(2, "0")}</span>{step}</li>)}</ol></div><div className="expected-actual"><div><h3>EXPECTED</h3><p>{selectedFinding.expected}</p></div><div><h3>ACTUAL</h3><p>{selectedFinding.actual}</p></div></div><div className="evidence-section trace-section"><h3>NETWORK TRACE <span>{selectedFinding.network.method} {selectedFinding.network.path}</span></h3><div className="trace-line"><code>{selectedFinding.network.method}</code><span>{selectedFinding.network.path}</span><b className={selectedFinding.network.status.startsWith("5") ? "trace-error" : "trace-ok"}>{selectedFinding.network.status}</b><small>{selectedFinding.network.duration}</small></div><h3>CONSOLE</h3><pre>{selectedFinding.console}</pre></div><div className="artifact-row"><h3>ARTIFACTS</h3>{findingArtifacts.map((file, i) => <button key={file} onClick={() => setCopied(true)}><span>{["▧", "⌁", "≋", "‹›"][i]}</span>{file}<i>↗</i></button>)}</div><div className="evidence-actions"><button className="button button-outline button-small" onClick={() => void copyReport()}>{copied ? "Copied ✓" : "Copy report"}</button><button className="button button-cream button-small" onClick={() => setScreen("entry")}>Start new run →</button></div></div></section>}
             {!fullScreen && <div className="split-handle vertical" role="separator" aria-orientation="vertical" aria-label="Resize browser and findings panels" tabIndex={0} onPointerDown={() => setDragging("vertical")} onDoubleClick={() => setBrowserSplit(60)} onKeyDown={(event) => handleSplitKey(event, "vertical")}><span/></div>}
             {!fullScreen && <section className="findings-panel"><div className="panel-heading"><div><span className="panel-icon findings-icon">≋</span><strong>{isLive ? "Findings feed" : "Findings"}</strong><span className="panel-count">{visibleFindings.length} found</span></div><button className="panel-more" aria-label="Findings options">⋯</button></div><div className="finding-list">{visibleFindings.slice(0, isLive ? 4 : 6).map((finding) => <FindingRow key={finding.id} finding={finding} active={selectedFinding.id === finding.id} onClick={() => setSelectedFinding(finding)}/>)}</div>{isLive && <div className="activity-box"><div className="subpanel-heading"><strong>Agent activity</strong><span>{new Set(stream.events.map((event) => event.agent)).size} active</span></div>{(activeRunId ? Array.from(new Set(stream.events.map((event) => event.agent))) : activityRoles).map((role, i) => <div className="activity-row" key={role}><StatusDot tone={i < 3 ? (i === 1 ? "amber" : "green") : "gray"}/><span>{role}</span><div className={`activity-meter role-${i}`}><i/></div><small>{i < 3 ? (i === 1 ? "checking" : "active") : "idle"}</small></div>)}</div>}</section>}
           </div>

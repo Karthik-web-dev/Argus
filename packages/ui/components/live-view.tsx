@@ -41,6 +41,8 @@ export function LiveView({
   demoCursorRun = 0,
 }: LiveViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const demoCursorRef = useRef<HTMLSpanElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const renderedSequenceRef = useRef(0);
@@ -139,6 +141,18 @@ export function LiveView({
     };
   }, [fixtureSrc, retry, runId]);
 
+  // The stage can be clamped (e.g. max-height in fullscreen) so the frame is
+  // letterboxed inside it; track its box to map cursor points onto the image.
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const observer = new ResizeObserver(([entry]) => {
+      setStageSize({ width: entry.contentRect.width, height: entry.contentRect.height });
+    });
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, []);
+
   useEffect(() => {
     const cursor = demoCursorRef.current;
     if (!cursor || demoCursorRun === 0) return;
@@ -158,8 +172,14 @@ export function LiveView({
   const pageScale = Math.min(frameSize.width / viewportWidth, frameSize.height / viewportHeight);
   const pageOffsetX = (frameSize.width - viewportWidth * pageScale) / 2;
   const pageOffsetY = (frameSize.height - viewportHeight * pageScale) / 2;
-  const frameX = (value: number) => ((pageOffsetX + value * pageScale) / frameSize.width) * 100;
-  const frameY = (value: number) => ((pageOffsetY + value * pageScale) / frameSize.height) * 100;
+  // object-fit: contain inside the stage box.
+  const fitScale = stageSize.width && stageSize.height
+    ? Math.min(stageSize.width / frameSize.width, stageSize.height / frameSize.height)
+    : 0;
+  const fitOffsetX = (stageSize.width - frameSize.width * fitScale) / 2;
+  const fitOffsetY = (stageSize.height - frameSize.height * fitScale) / 2;
+  const stageX = (value: number) => `${fitOffsetX + (pageOffsetX + value * pageScale) * fitScale}px`;
+  const stageY = (value: number) => `${fitOffsetY + (pageOffsetY + value * pageScale) * fitScale}px`;
 
   return (
     <section className="argus-live-view" aria-label="Live browser view">
@@ -168,6 +188,7 @@ export function LiveView({
         <span className={`argus-live-indicator ${fixtureSrc ? "fixture" : "live"}`}><i />{connection}</span>
       </header>
       <div
+        ref={stageRef}
         className="argus-live-stage"
         style={{ aspectRatio: `${frameSize.width} / ${frameSize.height}` }}
         aria-label={fixtureSrc ? fixtureAlt : "Chromium screencast canvas"}
@@ -182,12 +203,12 @@ export function LiveView({
             <CursorMark />
           </span>
         )}
-        {!fixtureSrc && cursorAction && hasPoint && (
+        {!fixtureSrc && cursorAction && hasPoint && fitScale > 0 && (
           <>
             <span
               key={cursorAction.key}
               className={`argus-live-cursor ${cursorAction.action === "click" ? "clicked" : ""}`}
-              style={{ left: `${frameX(cursorAction.x!)}%`, top: `${frameY(cursorAction.y!)}%` }}
+              style={{ left: stageX(cursorAction.x!), top: stageY(cursorAction.y!) }}
               aria-hidden="true"
             ><CursorMark />{cursorAction.action === "click" && <i className="argus-click-ripple" />}</span>
           </>

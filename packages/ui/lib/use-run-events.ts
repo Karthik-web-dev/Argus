@@ -193,6 +193,10 @@ export function useRunEvents(runId: string | null): RunEventStream {
             setStream((current) => ({ ...current, status: "failed", error: detail.error ?? "The run failed." }));
             return;
           }
+          if (detail.status === "cancelled") {
+            setStream((current) => ({ ...current, status: "failed", error: "Run stopped by user." }));
+            return;
+          }
         } catch (error) {
           if (signal.aborted) return;
           setStream((current) => ({

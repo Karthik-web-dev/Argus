@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from itertools import pairwise
 from pathlib import Path
@@ -119,6 +120,9 @@ def build_supervisor_graph(components: Mapping[str, Any], layout: RunArtifactLay
 
     def phase_node(phase: str, role: str, operation):
         def invoke(state: SupervisorState) -> dict[str, Any]:
+            from argus.cancellation import raise_if_cancelled
+
+            raise_if_cancelled(layout.run_dir.name)
             emit(state, "phase_changed", agent="supervisor", payload={"phase": phase})
             emit(state, "agent_active", agent=role, payload={"agent": role, "phase": phase})
             updates = operation(state)
@@ -197,6 +201,8 @@ def build_supervisor_graph(components: Mapping[str, Any], layout: RunArtifactLay
             set_context(list(by_case.values()))
         findings: list[Finding] = []
         evidence: dict[str, Evidence] = {}
+        # The live tester streams findings as cases finish; don't announce them twice.
+        already_emitted = set(getattr(components["tester"], "emitted_finding_ids", ()))
         for result in results:
             for finding in components["oracle"].evaluate(result):
                 case = by_case.get(result.test_id)
@@ -204,7 +210,8 @@ def build_supervisor_graph(components: Mapping[str, Any], layout: RunArtifactLay
                     finding = finding.model_copy(update={"steps": case.steps})
                 findings.append(finding)
                 evidence[finding.id] = result.evidence.model_copy(update={"finding_id": finding.id})
-                emit(state, "finding_created", agent="oracle", payload=finding.model_dump(mode="json"))
+                if finding.id not in already_emitted:
+                    emit(state, "finding_created", agent="oracle", payload=finding.model_dump(mode="json"))
         return {
             "findings": [item.model_dump(mode="json") for item in findings],
             "evidence_by_finding": {key: value.model_dump(mode="json") for key, value in evidence.items()},
@@ -213,13 +220,18 @@ def build_supervisor_graph(components: Mapping[str, Any], layout: RunArtifactLay
     def gate(state: SupervisorState) -> dict[str, Any]:
         findings = [Finding.model_validate(item) for item in state["findings"]]
         evidence = {key: Evidence.model_validate(item) for key, item in state["evidence_by_finding"].items()}
-        results = [components["gate"].evaluate(item, evidence[item.id]) for item in findings]
+        evaluate_many = getattr(components["gate"], "evaluate_many", None)
+        if callable(evaluate_many):
+            results = evaluate_many(findings)
+        else:
+            results = [components["gate"].evaluate(item, evidence[item.id]) for item in findings]
         reproductions = getattr(components["gate"], "reproduction", {})
         for finding_id, reproduction in reproductions.items():
             if finding_id in evidence:
                 evidence[finding_id] = evidence[finding_id].model_copy(update={"reproduction": reproduction})
-        for result in results:
-            emit(state, "gate_result", agent="gate", payload=result.model_dump(mode="json"))
+        if not getattr(components["gate"], "published_live", False):
+            for result in results:
+                emit(state, "gate_result", agent="gate", payload=result.model_dump(mode="json"))
         return {
             "gates": [item.model_dump(mode="json") for item in results],
             "gated_evidence_by_finding": {key: value.model_dump(mode="json") for key, value in evidence.items()},
@@ -243,7 +255,11 @@ def build_supervisor_graph(components: Mapping[str, Any], layout: RunArtifactLay
         from argus.reporter.deduplicator import deduplicate_findings
 
         findings = [Finding.model_validate(item) for item in state["findings"]]
-        unique = [group[0] for group in deduplicate_findings(findings)]
+        accepted = set(state.get("accepted_finding_ids", []))
+        # Represent each group with a gate-accepted member when one exists, so the
+        # reporter does not silently drop a real bug because group[0] was flaky.
+        unique = [next((item for item in group if item.id in accepted), group[0])
+                  for group in deduplicate_findings(findings)]
         return {"deduplicated_findings": [item.model_dump(mode="json") for item in unique]}
 
     def report(state: SupervisorState) -> dict[str, Any]:
@@ -257,7 +273,10 @@ def build_supervisor_graph(components: Mapping[str, Any], layout: RunArtifactLay
         return {"bugs_found": [item.model_dump(mode="json") for item in reports]}
 
     def export(state: SupervisorState) -> dict[str, Any]:
+        passed = {item["test_id"] for item in state.get("test_results", []) if item.get("verdict") == "PASS"}
         cases = [TestCase.model_validate(item) for item in state["test_cases"]]
+        if state.get("test_results"):
+            cases = [case for case in cases if case.id in passed]
         paths = components["exporter"].export(cases, layout.tests_dir)
         return {"exports": [str(path) for path in paths]}
 
@@ -385,6 +404,13 @@ def run_supervisor(
     (layout.reports_dir / "bug_reports.json").write_text(json.dumps(
         [item.model_dump(mode="json") for item in state.bugs_found], indent=2,
     ) + "\n", encoding="utf-8")
+    try:
+        from argus.reporter.document import write_report_documents
+
+        write_report_documents(list(state.bugs_found), layout.reports_dir,
+                               target_url=target_url, run_id=run_id)
+    except Exception:  # noqa: BLE001 - the shareable PDF must never fail a finished run
+        logging.getLogger(__name__).exception("Could not render the bug report document")
     components["event_bus"].emit(RunEvent(
         id=uuid4().hex, run_id=run_id, agent="supervisor", correlation_id=run_id,
         type="run_completed", payload={"status": "completed", "finding_count": len(findings)},

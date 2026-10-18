@@ -11,6 +11,8 @@ from uuid import uuid4
 from argus_contracts.artifacts import RunArtifactLayout
 from argus_contracts.models import Evidence, RunEvent
 from playwright.async_api import CDPSession, Page
+
+from argus.cancellation import is_cancelled
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -29,9 +31,14 @@ async def execute_case(session: BrowserSession, case: TestCase, layout: RunArtif
                        *, initial_url: str | None = None,
                        synthetic_values: tuple[str, ...] = (),
                        data_factory: TestDataFactory | None = None,
-                       on_action: Callable[[dict[str, Any]], None] | None = None) -> tuple[str, Evidence, int]:
+                       on_action: Callable[[dict[str, Any]], None] | None = None,
+                       step_delay_ms: int = 0) -> tuple[str, Evidence, int]:
     started = asyncio.get_running_loop().time()
     page = session.page
+    # Enforce step timeout bounds wherever the case came from, not only at parse time.
+    from argus.spec.parser import _bounded_step
+
+    case = case.model_copy(update={"steps": [_bounded_step(step) for step in case.steps]})
     factory = data_factory or TestDataFactory()
     preparation_error = None
     try:
@@ -76,6 +83,9 @@ async def execute_case(session: BrowserSession, case: TestCase, layout: RunArtif
     for step_index, step in enumerate(case.steps):
         if verdict != "PASS":
             break
+        if is_cancelled(layout.run_dir.name):
+            verdict, actual = "INCONCLUSIVE", "Run stopped by user before this step."
+            break
         action_started = asyncio.get_running_loop().time()
         action = await _action_payload(page, step, step_index, case)
         layout.append_event(RunEvent(
@@ -85,13 +95,19 @@ async def execute_case(session: BrowserSession, case: TestCase, layout: RunArtif
         ))
         if on_action is not None:
             on_action(action)
+        if step_delay_ms > 0:
+            # Demo pacing: let viewers see the cursor land before the action fires.
+            await asyncio.sleep(step_delay_ms / 1000)
         await recorder.begin_step(
             step_index, _step_element(page, step),
             step=step,
             sensitive=bool(step.value and step.value in recorder.redactor.secret_values),
         )
         try:
-            async with asyncio.timeout(step.timeout_ms / 1000):
+            # A wait step sleeps for its full timeout_ms, so give it a grace
+            # period; otherwise it always races its own deadline and fails.
+            deadline_ms = step.timeout_ms + (1000 if step.action == "wait" else 0)
+            async with asyncio.timeout(deadline_ms / 1000):
                 await _run_step(
                     page, step, cdp_session=session.cdp_session, session=session,
                     console_baseline=console_baseline, request_baseline=request_baseline,
@@ -104,11 +120,18 @@ async def execute_case(session: BrowserSession, case: TestCase, layout: RunArtif
             if step.action == "assert" or step.action.startswith("assert_"):
                 verdict = "FAIL"
                 failure_kind = "assertion"
-                actual = f"Assertion at step {step_index} was not satisfied within {step.timeout_ms} ms: {exc}"
+                if step.action == "assert":
+                    looked_for = step.value or step.locator
+                    actual = (f"Assertion at step {step_index} was not satisfied within {step.timeout_ms} ms: "
+                              f"expected text {looked_for!r} was not visible on the page.")
+                else:
+                    detail = str(exc) or f"{step.action} {step.locator}".strip()
+                    actual = f"Assertion at step {step_index} was not satisfied within {step.timeout_ms} ms: {detail}"
             else:
                 verdict = "INCONCLUSIVE"
                 failure_kind = "timeout"
-                actual = f"Step {step_index} timed out after {step.timeout_ms} ms: {exc}"
+                detail = str(exc) or f"{step.action} {step.locator}".strip()
+                actual = f"Step {step_index} timed out after {step.timeout_ms} ms: {detail}"
         except Exception as exc:  # noqa: BLE001 - action failures must be recorded as test results.
             verdict, actual = "FAIL", f"{type(exc).__name__}: {exc}"
             failure_kind = "assertion" if step.action == "assert" or step.action.startswith("assert_") else "interaction"
@@ -170,7 +193,9 @@ async def _action_payload(page: Page, step: Step, step_index: int, case: TestCas
                 await element.first.scroll_into_view_if_needed(timeout=500)
             except PlaywrightError:
                 pass
-            box = await element.first.bounding_box()
+            # Overlay only: never wait for an element that may not exist yet
+            # (the default 30 s wait made every failing assert stall the run).
+            box = await element.first.bounding_box(timeout=750)
             viewport = await page.evaluate("() => ({width: innerWidth, height: innerHeight})")
             if box is not None:
                 payload.update({
@@ -191,8 +216,30 @@ def _step_element(page: Page, step: Step):
     if step.action in {"click", "double_click", "assert_double_submit", "assert_mobile_layout", "assert_back_mid_flow", "assert_refresh_mid_flow", "fill", "type_text", "hover", "press", "assert_invalid", "assert_password_masked", "assert_value_length", "assert_numeric_value", "assert_input_value", "assert_sort_stability", "assert_numeric_boundary"} and step.locator:
         return _semantic_locator(page, step.locator)
     if step.action == "assert":
-        return page.get_by_text(step.value or step.locator, exact=False)
+        return _assert_target(page, step)
     return None
+
+
+_HTML_TAGS = ("a|article|aside|body|button|dialog|div|footer|form|h[1-6]|header|img|input|label|li|main|"
+              "nav|ol|p|section|select|span|table|tbody|td|textarea|th|tr|ul")
+# role=/css= engines, #id, .class, [attr], or a known tag optionally followed by [attr], .class, #id or :pseudo.
+_SELECTOR_SHAPE = re.compile(rf"^(role=|css=|text=|xpath=|//|[#.\[]|(?:{_HTML_TAGS})(?:[\[.#:]|$))", re.IGNORECASE)
+
+
+def _assert_target(page: Page, step: Step):
+    """Visible-text assertion, or element visibility when the target is a selector.
+
+    Models sometimes write ``assert img[src]`` or ``assert body``; searching for
+    that literal text can never pass, so treat selector-shaped targets as elements.
+    """
+    if step.value:
+        return page.get_by_text(step.value, exact=False)
+    target = step.locator.strip()
+    if target.startswith("text="):
+        return page.get_by_text(target.removeprefix("text=").strip("'\""), exact=False)
+    if " " not in target and _SELECTOR_SHAPE.match(target):
+        return _semantic_locator(page, target) if target.startswith("role=") else page.locator(target)
+    return page.get_by_text(target, exact=False)
 
 
 async def _run_step(page: Page, step: Step, *, cdp_session: CDPSession | None = None,
@@ -204,8 +251,7 @@ async def _run_step(page: Page, step: Step, *, cdp_session: CDPSession | None = 
     elif step.action == "wait":
         await page.wait_for_timeout(min(step.timeout_ms, 10000))
     elif step.action == "assert":
-        locator = page.get_by_text(step.value or step.locator, exact=False)
-        await locator.first.wait_for(state="visible", timeout=step.timeout_ms)
+        await _assert_target(page, step).first.wait_for(state="visible", timeout=step.timeout_ms)
     elif step.action == "assert_no_broken_images":
         if await page.locator("img").count() == 0:
             raise TestStepInconclusive("This page has no images to check.")

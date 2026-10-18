@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 _SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_TERMINAL_STATUSES = {"completed", "failed"}
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
 class RunStore:
@@ -110,6 +111,17 @@ class RunStore:
                    VALUES (?, ?, ?, 'queued', ?, ?)""",
                 (run_id, target_url, spec, now, now),
             )
+
+    def delete(self, run_id: str) -> bool:
+        """Remove a run's index row and its artifact directory."""
+        if not _SAFE_RUN_ID.fullmatch(run_id):
+            return False
+        with self._connect() as connection:
+            deleted = connection.execute("DELETE FROM runs WHERE run_id = ?", (run_id,)).rowcount
+        run_dir = (self.runs_root / run_id).resolve()
+        if run_dir.parent == self.runs_root.resolve() and run_dir.is_dir():
+            shutil.rmtree(run_dir, ignore_errors=True)
+        return bool(deleted)
 
     def update(self, run_id: str, *, status: str, error: str | None = None) -> None:
         with self._connect() as connection:

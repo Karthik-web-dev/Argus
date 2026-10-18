@@ -132,8 +132,8 @@ async def bind_cases(
 
     Matching uses role and normalized accessible name. The model can select only
     among catalog IDs supplied in its schema, so it cannot invent CSS, XPath, or
-    coordinate targets. ``ModelGateway`` request keys make fallback decisions
-    replayable and avoid repeat calls for identical cases.
+    coordinate targets. Ambiguous targets shared across cases are resolved once,
+    in a single model call, so binding costs at most one request per run.
     """
     if not 0 <= deterministic_threshold <= 1 or not 0 <= ambiguity_margin <= 1:
         raise ValueError("binding thresholds must be between zero and one")
@@ -141,6 +141,8 @@ async def bind_cases(
     unique_elements = _unique_semantic_catalog(elements)
     outcomes: list[BindingResult] = []
 
+    # Pass 1: resolve what we can deterministically and collect ambiguous steps.
+    prepared: list[tuple[TestCase, list[Step], list[int], list[int]]] = []
     for case in test_cases:
         steps = list(case.steps)
         deterministic: list[int] = []
@@ -171,76 +173,99 @@ async def bind_cases(
                 deterministic.append(index)
             else:
                 ambiguous.append(index)
+        prepared.append((case, steps, deterministic, ambiguous))
 
+    # Pass 2: journeys share steps (every journey signs in first, for example),
+    # so resolve each distinct (action, target) once in a single model call.
+    targets: dict[tuple[str, str], Step] = {}
+    target_journeys: dict[tuple[str, str], list[str]] = {}
+    for case, steps, _, ambiguous in prepared:
+        for index in ambiguous:
+            key = (steps[index].action, steps[index].locator)
+            if key not in targets:
+                targets[key] = steps[index]
+                target_journeys[key] = []
+            if case.journey not in target_journeys[key]:
+                target_journeys[key].append(case.journey)
+    target_keys = list(targets)
+    compatible_elements = {
+        element_id: element for element_id, element in unique_elements.items()
+        if any(_action_compatible(step, element) for step in targets.values())
+    }
+    resolved: dict[tuple[str, str], ElementCatalogEntry] = {}
+    model_error = ""
+    if target_keys and compatible_elements:
+        candidate_rows = [
+            {"id": item.id, "role": item.role, "name": item.name, "form_group": item.form_group}
+            for item in sorted(compatible_elements.values(), key=lambda entry: entry.id)
+        ]
+        prompt = json.dumps({
+            "steps": [{"step_index": i, "action": targets[key].action,
+                       "abstract_target": targets[key].locator,
+                       "used_in_journeys": target_journeys[key],
+                       "compatible_element_ids": sorted(
+                           element_id for element_id, element in compatible_elements.items()
+                           if _action_compatible(targets[key], element))}
+                      for i, key in enumerate(target_keys)],
+            "catalog": candidate_rows,
+            "instruction": "Choose the catalog element that best matches each action and journey context. Return each requested step exactly once. Never invent a selector.",
+        }, ensure_ascii=False, sort_keys=True)
+        try:
+            response = await model.generate(
+                tier=tier,
+                run_id=run_id,
+                system="Resolve abstract browser actions to supplied accessible controls. Return only schema-valid bindings.",
+                prompt=prompt,
+                schema=_schema(list(range(len(target_keys))), list(compatible_elements)),
+                max_tokens=min(4096, 64 + 48 * len(target_keys)),
+            )
+            choices = {item["step_index"]: item["element_id"] for item in response["bindings"]}
+            if len(choices) != len(response["bindings"]):
+                raise ValueError("model bound a step more than once")
+            for i, key in enumerate(target_keys):
+                element = compatible_elements.get(choices.get(i, ""))
+                if element is not None and _action_compatible(targets[key], element):
+                    resolved[key] = element
+        except Exception as exc:  # noqa: BLE001 - model failure must degrade to safe fallback
+            resolved.clear()
+            model_error = f"{type(exc).__name__}: {exc}"
+
+    # Pass 3: apply the shared resolutions to each case.
+    for case, steps, deterministic, ambiguous in prepared:
         model_bound: list[int] = []
         fallback_bound: list[int] = []
         failure_reason = ""
-        compatible_elements = {
-            element_id: element for element_id, element in unique_elements.items()
+        case_compatible = {
+            element_id: element for element_id, element in compatible_elements.items()
             if any(_action_compatible(steps[index], element) for index in ambiguous)
-        } if ambiguous else {}
-        if ambiguous and compatible_elements:
-            abstract_steps = list(steps)
-            candidate_rows = [
-                {"id": item.id, "role": item.role, "name": item.name,
-                 "form_group": item.form_group, "semantic_locator": item.semantic_locator}
-                for item in sorted(compatible_elements.values(), key=lambda entry: entry.id)
-            ]
-            prompt = json.dumps({
-                "journey": case.journey,
-                "description": case.description,
-                "steps": [{"step_index": i, "action": steps[i].action,
-                           "abstract_target": steps[i].locator,
-                           "compatible_element_ids": [element_id for element_id, element in compatible_elements.items()
-                                                      if _action_compatible(steps[i], element)]}
-                          for i in ambiguous],
-                "catalog": candidate_rows,
-                "instruction": "Choose the catalog element that best matches each action and journey context. Return each requested step exactly once. Never invent a selector.",
-            }, ensure_ascii=False, sort_keys=True)
-            try:
-                response = await model.generate(
-                    tier=tier,
-                    run_id=run_id,
-                    system="Resolve abstract browser actions to supplied accessible controls. Return only schema-valid bindings.",
-                    prompt=prompt,
-                    schema=_schema(ambiguous, list(compatible_elements)),
-                    max_tokens=512,
-                )
-                choices = {item["step_index"]: item["element_id"]
-                           for item in response["bindings"]}
-                if set(choices) != set(ambiguous) or len(choices) != len(response["bindings"]):
-                    raise ValueError("model did not bind every ambiguous step exactly once")
-                for index in ambiguous:
-                    element = compatible_elements.get(choices[index])
-                    if element is None or not _action_compatible(steps[index], element):
-                        raise ValueError(f"model selected an incompatible element for step {index}")
+        }
+        if ambiguous and case_compatible:
+            for index in ambiguous:
+                element = resolved.get((steps[index].action, steps[index].locator))
+                if element is not None:
                     steps[index] = steps[index].model_copy(update={"locator": element.semantic_locator})
                     model_bound.append(index)
-            except Exception as exc:  # noqa: BLE001 - model failure must degrade to safe fallback
-                steps = abstract_steps
-                model_bound.clear()
-                failure_reason = f"Ambiguous steps could not be resolved safely: {type(exc).__name__}: {exc}"
-                # If the model is unavailable, accept only a strong, clearly
-                # separated semantic match; ambiguous controls stay unresolved.
-                for index in ambiguous:
-                    ranked = sorted(
-                        ((_candidate_score(steps[index], element), element)
-                         for element in compatible_elements.values()),
-                        key=lambda item: (-item[0], item[1].id),
-                    )
-                    if (ranked and ranked[0][0] >= 0.72
-                            and (len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= max(ambiguity_margin, 0.12))):
-                        steps[index] = steps[index].model_copy(update={
-                            "locator": ranked[0][1].semantic_locator,
-                        })
-                        fallback_bound.append(index)
+                    continue
+                # If the model is unavailable or skipped this step, accept only a
+                # strong, clearly separated match; ambiguous controls stay unresolved.
+                ranked = sorted(
+                    ((_candidate_score(steps[index], element), element)
+                     for element in case_compatible.values()),
+                    key=lambda item: (-item[0], item[1].id),
+                )
+                if (ranked and ranked[0][0] >= 0.72
+                        and (len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= max(ambiguity_margin, 0.12))):
+                    steps[index] = steps[index].model_copy(update={
+                        "locator": ranked[0][1].semantic_locator,
+                    })
+                    fallback_bound.append(index)
+            failure_reason = "Ambiguous steps could not be resolved safely: " + (
+                model_error or "model did not bind every ambiguous step")
         elif ambiguous:
             failure_reason = "No unique visible semantic locator is available in the element catalog."
 
         bound_case = case.model_copy(update={"steps": steps})
         all_bound = not ambiguous or len(model_bound) + len(fallback_bound) == len(ambiguous)
-        if all_bound:
-            failure_reason = ""
         outcomes.append(BindingResult(
             test_case=bound_case,
             verdict="BOUND" if all_bound else "INCONCLUSIVE",

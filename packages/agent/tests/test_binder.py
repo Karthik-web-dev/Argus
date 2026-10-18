@@ -123,3 +123,24 @@ def test_fixture_journeys_bind_at_least_ninety_percent_without_model_calls():
         assert gateway.requests == []
 
     asyncio.run(scenario())
+
+
+def test_shared_ambiguous_steps_across_cases_use_one_model_call():
+    async def scenario():
+        elements = [
+            _element("favorite-a", "button", "Favorite", 'role=button[name="Favorite"] >> nth=0'),
+            _element("favorite-b", "button", "Favorite", 'role=button[name="Favorite"] >> nth=1'),
+        ]
+        gateway = FakeGateway({"bindings": [{"step_index": 0, "element_id": "favorite-a"}]})
+        step = Step(action="click", locator="role=button[name=Favorite]")
+        cases = [_case(step), _case(Step(action="goto", locator="/"), step)]
+
+        results = await bind_cases(cases, elements, gateway=gateway)
+
+        assert len(gateway.requests) == 1
+        assert [r.verdict for r in results] == ["BOUND", "BOUND"]
+        assert results[0].model_steps == [0]
+        assert results[1].model_steps == [1]
+        assert results[1].test_case.steps[1].locator == elements[0].semantic_locator
+
+    asyncio.run(scenario())

@@ -26,7 +26,11 @@ const payloadNumber = (event: RunEvent, key: string): number | null => {
 export function summarizeFindings(events: RunEvent[]): FindingSummary[] {
   const findings = new Map<string, FindingSummary>();
   for (const event of events) {
-    const id = payloadString(event, "finding_id");
+    // finding_created carries the Finding itself (key "id"); gate and
+    // verification events reference it as "finding_id".
+    const id = event.type === "finding_created"
+      ? payloadString(event, "id") ?? payloadString(event, "finding_id")
+      : payloadString(event, "finding_id");
     if (event.type === "finding_created" && id) {
       const current = findings.get(id);
       findings.set(id, {

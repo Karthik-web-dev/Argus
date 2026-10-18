@@ -108,3 +108,22 @@ def test_replay_missing_cassette_fails_without_provider(tmp_path):
         assert provider.calls == 0
 
     asyncio.run(scenario())
+
+
+def test_groq_route_properties_and_env_defaults(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test12345")
+    monkeypatch.setenv("ARGUS_MODEL_CHEAP_PROVIDER", "groq")
+    monkeypatch.setenv("ARGUS_MODEL_CHEAP_NAME", "llama-3.3-70b-versatile")
+    monkeypatch.delenv("ARGUS_MODEL_CHEAP_BASE_URL", raising=False)
+    monkeypatch.delenv("ARGUS_MODEL_CHEAP_API_KEY", raising=False)
+    monkeypatch.delenv("ARGUS_MODEL_BASE_URL", raising=False)
+    monkeypatch.delenv("ARGUS_MODEL_API_KEY", raising=False)
+
+    settings = ModelSettings.from_env()
+    cheap = settings.routes["cheap"]
+    assert cheap.is_groq is True
+    assert cheap.is_openrouter is False
+    assert cheap.base_url == "https://api.groq.com/openai/v1"
+    assert cheap.api_key == "gsk-test12345"
+    assert cheap.model == "llama-3.3-70b-versatile"
+

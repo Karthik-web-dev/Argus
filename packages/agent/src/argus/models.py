@@ -63,6 +63,14 @@ class ModelRoute:
         return self.provider.lower(), self.model
 
     @property
+    def is_groq(self) -> bool:
+        return self.provider.lower() == "groq" or "api.groq.com" in self.base_url.lower()
+
+    @property
+    def is_openrouter(self) -> bool:
+        return self.provider.lower() == "openrouter" or "openrouter.ai" in self.base_url.lower()
+
+    @property
     def configured(self) -> bool:
         return bool(self.base_url and self.model)
 
@@ -83,16 +91,28 @@ class ModelSettings:
     @classmethod
     def from_env(cls) -> ModelSettings:
         import argus.config  # noqa: F401 - ensure environment is loaded
-        from dotenv import load_dotenv
-        load_dotenv()
+        groq_api_key = os.getenv("GROQ_API_KEY", "")
+        global_api_key = os.getenv("ARGUS_MODEL_API_KEY", "")
+        global_base_url = os.getenv("ARGUS_MODEL_BASE_URL", "")
         routes: dict[ModelTier, ModelRoute] = {}
         for tier in TIERS:
             prefix = f"ARGUS_MODEL_{tier.upper()}_"
+            raw_provider = os.getenv(prefix + "PROVIDER", os.getenv("ARGUS_MODEL_PROVIDER", "openai_compatible"))
+            raw_base_url = os.getenv(prefix + "BASE_URL", global_base_url)
+            raw_api_key = os.getenv(prefix + "API_KEY", global_api_key)
+
+            # Auto-detect Groq defaults
+            is_groq = raw_provider.lower() == "groq" or "api.groq.com" in raw_base_url.lower()
+            if is_groq and not raw_base_url:
+                raw_base_url = "https://api.groq.com/openai/v1"
+            if is_groq and not raw_api_key and groq_api_key:
+                raw_api_key = groq_api_key
+
             routes[tier] = ModelRoute(
-                provider=os.getenv(prefix + "PROVIDER", "openai_compatible"),
+                provider=raw_provider,
                 model=os.getenv(prefix + "NAME", ""),
-                base_url=os.getenv(prefix + "BASE_URL", os.getenv("ARGUS_MODEL_BASE_URL", "")),
-                api_key=os.getenv(prefix + "API_KEY", os.getenv("ARGUS_MODEL_API_KEY", "")),
+                base_url=raw_base_url,
+                api_key=raw_api_key,
             )
         return cls(
             routes=routes,
@@ -178,10 +198,17 @@ class SharedRateLimiter:
             async with self._lock:
                 now = time.monotonic()
                 self._timestamps = [t for t in self._timestamps if now - t < 60]
-                if len(self._timestamps) < self.limit:
+                # Pacing: ensure minimum spacing between requests to avoid burst rate-limits
+                min_interval = 60.0 / self.limit
+                last_time = self._timestamps[-1] if self._timestamps else 0.0
+                time_since_last = now - last_time
+                if time_since_last < min_interval:
+                    delay = min_interval - time_since_last
+                elif len(self._timestamps) < self.limit:
                     self._timestamps.append(now)
                     return
-                delay = max(0.01, 60 - (now - self._timestamps[0]))
+                else:
+                    delay = max(0.01, 60.0 - (now - self._timestamps[0]))
             await asyncio.sleep(delay)
 
 
@@ -222,6 +249,14 @@ class CassetteStore:
 class OpenAICompatibleProvider:
     """Small stdlib adapter; model/provider changes are configuration-only."""
 
+    # Set by ModelGateway so retries and fallback re-posts share the run's pacing;
+    # the gateway already paces the first attempt of every call.
+    rate_limiter: SharedRateLimiter | None = None
+
+    async def _pace(self) -> None:
+        if self.rate_limiter is not None:
+            await self.rate_limiter.acquire()
+
     async def generate(self, *, route: ModelRoute, system: str, prompt: Prompt,
                        schema: dict[str, Any], max_tokens: int,
                        timeout_seconds: float = 60.0) -> tuple[Any, int]:
@@ -230,25 +265,39 @@ class OpenAICompatibleProvider:
         url = route.base_url.rstrip("/")
         if not url.endswith("/chat/completions"):
             url += "/chat/completions"
+
+        # Build schema instructions in case json_schema is unsupported or fails
+        schema_json = json.dumps(schema)
+        system_content = f"{system}\n\nYou must respond with valid JSON strictly adhering to this JSON Schema:\n{schema_json}"
+
+        # Groq's constrained grammar engine throws `json_validate_failed` on rich schemas with minItems/enums.
+        # Groq recommends `response_format: {"type": "json_object"}` with the schema injected into the system prompt.
+        default_response_format: dict[str, Any] = (
+            {"type": "json_object"}
+            if route.is_groq
+            else {"type": "json_schema", "json_schema": {
+                "name": schema.get("title", "argus_response"), "strict": False, "schema": schema,
+            }}
+        )
+
         body: dict[str, Any] = {
             "model": route.model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            "messages": [{"role": "system", "content": system_content}, {"role": "user", "content": prompt}],
             "temperature": 0,
             "max_tokens": max_tokens,
-            # strict=True plus the full contract schema routinely stalls OpenRouter
-            # and Gemini-compatible endpoints for minutes. Local jsonschema
-            # validation in ModelGateway still fail-closes on malformed output.
-            "response_format": {"type": "json_schema", "json_schema": {
-                "name": schema.get("title", "argus_response"), "strict": False, "schema": schema,
-            }},
-            # Keep reasoning models bounded so they don't consume all max_tokens on internal CoT
-            "reasoning": {"effort": "low"},
+            "response_format": default_response_format,
         }
+        # Only OpenRouter supports the reasoning parameter; Groq and other OpenAI endpoints reject it with 400
+        if route.is_openrouter:
+            # Keep reasoning models bounded so they don't consume all max_tokens on internal CoT
+            # body["reasoning"] = {"effort": "low"}
+            pass
+
         headers = {"Content-Type": "application/json"}
         if route.api_key:
             headers["Authorization"] = f"Bearer {route.api_key}"
 
-        max_http_attempts = 3
+        max_http_attempts = 6
         data: dict[str, Any] | None = None
         for attempt_idx in range(max_http_attempts):
             try:
@@ -262,6 +311,26 @@ class OpenAICompatibleProvider:
                         )
                     ) as client:
                         response = await client.post(url, json=body, headers=headers)
+                        # Groq and certain OpenAI providers return 400 if 'json_schema' is unsupported,
+                        # or if server-side grammar validation fails (e.g. Groq "json_validate_failed").
+                        if response.status_code == 400 and body.get("response_format"):
+                            err_text = response.text.lower()
+                            if any(k in err_text for k in ("json_schema", "response_format", "schema", "json_validate_failed", "failed to validate json", "failed to generate json")):
+                                current_type = body.get("response_format", {}).get("type")
+                                if current_type == "json_schema":
+                                    logging.getLogger(__name__).info(
+                                        "Provider rejected or failed json_schema validation; retrying with response_format: {'type': 'json_object'}"
+                                    )
+                                    body["response_format"] = {"type": "json_object"}
+                                else:
+                                    logging.getLogger(__name__).info(
+                                        "Provider failed %s validation; retrying with prompt-enforced JSON without response_format constraint",
+                                        current_type,
+                                    )
+                                    del body["response_format"]
+                                await self._pace()
+                                response = await client.post(url, json=body, headers=headers)
+
                         response.raise_for_status()
                         data = response.json()
                         break
@@ -269,15 +338,21 @@ class OpenAICompatibleProvider:
                 if exc.response.status_code == 429 and attempt_idx < max_http_attempts - 1:
                     retry_after = exc.response.headers.get("Retry-After")
                     try:
-                        delay = float(retry_after) if retry_after else float(2 * (attempt_idx + 1))
+                        delay = float(retry_after.rstrip("s")) if retry_after else float(2 * (attempt_idx + 1))
                     except ValueError:
                         delay = float(2 * (attempt_idx + 1))
-                    delay = min(delay, 15.0)
+                    delay = max(delay + 1.0, 2.0)  # Add 1s buffer so rate window has strictly reset
+                    delay = min(delay, 35.0)
+                    headers_429 = exc.response.headers
                     logging.getLogger(__name__).warning(
-                        "Model provider returned HTTP 429; retrying in %.1fs (attempt %d/%d)",
+                        "Model provider returned HTTP 429; retrying in %.1fs (attempt %d/%d; "
+                        "remaining requests=%s, remaining tokens=%s)",
                         delay, attempt_idx + 1, max_http_attempts,
+                        headers_429.get("x-ratelimit-remaining-requests", "?"),
+                        headers_429.get("x-ratelimit-remaining-tokens", "?"),
                     )
                     await asyncio.sleep(delay)
+                    await self._pace()
                     continue
                 if exc.response.status_code == 429:
                     retry_after = exc.response.headers.get("Retry-After")
@@ -287,7 +362,7 @@ class OpenAICompatibleProvider:
                         f"rate limit, and model access.{suffix}"
                     ) from exc
                 raise RuntimeError(
-                    f"Model provider returned HTTP {exc.response.status_code}."
+                    f"Model provider returned HTTP {exc.response.status_code}: {exc.response.text[:200]}"
                 ) from exc
             except TimeoutError as exc:
                 raise RuntimeError(
@@ -314,10 +389,21 @@ class OpenAICompatibleProvider:
                     if lines and lines[-1].startswith("```"):
                         lines = lines[:-1]
                     cleaned = "\n".join(lines).strip()
-                value = json.loads(cleaned)
+                try:
+                    value = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    # If model returned text surrounding JSON (e.g. conversational preamble),
+                    # attempt to locate the first '{' and last '}'
+                    first_brace = cleaned.find("{")
+                    last_brace = cleaned.rfind("}")
+                    if first_brace != -1 and last_brace > first_brace:
+                        value = json.loads(cleaned[first_brace:last_brace + 1])
+                    else:
+                        raise
             else:
                 value = content
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            logging.getLogger(__name__).warning("Failed to decode model response JSON: %r", content if 'content' in locals() else None)
             raise MalformedModelResponse("Provider returned no valid JSON response content.") from exc
         usage = data.get("usage", {})
         tokens = int(usage.get("total_tokens", 0))
@@ -335,6 +421,8 @@ class ModelGateway:
         self.provider = provider or OpenAICompatibleProvider()
         self.cassettes = cassette_store or CassetteStore(self.settings.cassette_dir, self.settings.mode)
         self.rate_limiter = SharedRateLimiter(self.settings.requests_per_minute)
+        if isinstance(self.provider, OpenAICompatibleProvider):
+            self.provider.rate_limiter = self.rate_limiter
         self.budget = RunBudget(max_calls=self.settings.max_calls_per_run,
                                 max_tokens=self.settings.max_tokens_per_run)
 
@@ -371,12 +459,14 @@ class ModelGateway:
                 await self.budget.reconcile(run_id, token_cap, 0)
                 raise
             try:
+                logging.getLogger(__name__).debug(
+                    "Raw model JSON: %s", json.dumps(raw, ensure_ascii=False))
                 result = self._validate(raw, schema)
-            except MalformedModelResponse:
+            except MalformedModelResponse as val_err:
                 await self.budget.reconcile(run_id, token_cap, tokens)
                 if attempt == 0:
                     logging.getLogger(__name__).warning(
-                        "Model output for tier %s failed schema validation; retrying once.", tier,
+                        "Model output for tier %s failed schema validation (%s); retrying once.", tier, val_err,
                     )
                     continue
                 raise

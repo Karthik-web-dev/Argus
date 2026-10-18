@@ -99,19 +99,23 @@ async def build_report(
     """Build one report; an injected gateway performs exactly one cheap call."""
     if gate.finding_id != finding.id or verification.finding_id != finding.id:
         raise ValueError("gate and Red Team verification must match the finding")
-    if gate.verdict != "ACCEPTED" or verification.verdict != "CONFIRMED":
-        raise ValueError("Reporter only creates reports for accepted, confirmed findings")
+    # The Evidence Gate is the required filter; the Red Team can veto (REFUTED)
+    # but an INCONCLUSIVE review (e.g. not yet configured) does not block a report.
+    if gate.verdict != "ACCEPTED" or verification.verdict == "REFUTED":
+        raise ValueError("Reporter only creates reports for gate-accepted, unrefuted findings")
     if evidence.finding_id not in (None, finding.id):
         raise ValueError("evidence belongs to a different finding")
 
-    severity = severity_for(
+    from argus.reporter.plain_language import infer_severity
+
+    severity = manual_severity or infer_severity(finding.oracle_id, finding.actual or evidence.actual) or severity_for(
         category,
         impact=finding.actual,
         manual_override=manual_severity,
     )
     confidence = confidence_score(finding, gate, verification)
     if generator is None:
-        title = _fallback_title(finding)
+        title = _fallback_title(finding, evidence)
         summary = finding.actual or evidence.actual or finding.symptom_signature
     else:
         prompt = json.dumps({
@@ -133,7 +137,7 @@ async def build_report(
         )
         title, summary = narrative["title"].strip(), narrative["summary"].strip()
 
-    actual = evidence.actual or finding.actual
+    actual = finding.actual or evidence.actual
     report = BugReport(
         id=f"report-{finding.id}",
         severity=severity,
@@ -145,9 +149,11 @@ async def build_report(
         evidence=evidence,
         playwright_repro_path=f"tests/repro/{finding.id}.spec.ts",
         affected_paths=list(finding.affected_paths),
-        verified_by="red_team",
+        verified_by="red_team" if verification.verdict == "CONFIRMED" else "none",
     )
-    validate_receipts(report, finding, summary=summary)
+    # Deterministic titles are derived from the receipts themselves; only an
+    # LLM-written title needs the claim-support check.
+    validate_receipts(report, finding, summary=summary, check_title=generator is not None)
     return ReportDocument(
         report=report,
         summary=summary,
@@ -162,6 +168,7 @@ def validate_receipts(
     *,
     summary: str = "",
     artifact_root: Path | None = None,
+    check_title: bool = True,
 ) -> None:
     """Reject report claims or artifact links that cannot be traced to receipts."""
     problems: list[str] = []
@@ -181,7 +188,8 @@ def validate_receipts(
         problems.append("actual behavior is not supported by the finding/evidence receipt")
 
     receipt_text = _receipt_text(evidence)
-    for label, claim in (("title", report.title), ("summary", summary)):
+    claims = (("title", report.title), ("summary", summary)) if check_title else (("summary", summary),)
+    for label, claim in claims:
         if claim.strip() and not _claim_supported(claim, receipt_text, finding.symptom_signature):
             problems.append(f"{label} contains a claim not supported by the attached receipts")
 
@@ -265,6 +273,11 @@ def _evidence_summary(evidence: Evidence) -> str:
     return ", ".join(items) if items else "attached evidence bundle"
 
 
-def _fallback_title(finding: Finding) -> str:
-    text = finding.symptom_signature.strip().rstrip(".")
-    return text[:1].upper() + text[1:] if text else "Verified application defect"
+def _fallback_title(finding: Finding, evidence: Evidence | None = None) -> str:
+    from argus.reporter.plain_language import human_title, is_unreadable_title
+
+    signature = finding.symptom_signature.strip().rstrip(".")
+    if signature and not is_unreadable_title(signature):
+        return signature[:1].upper() + signature[1:]
+    actual = finding.actual or (evidence.actual if evidence is not None else "")
+    return human_title(finding.oracle_id, actual, list(finding.steps))

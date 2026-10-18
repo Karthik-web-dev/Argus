@@ -16,6 +16,7 @@ from argus_contracts.models import (
     Evidence,
     Finding,
     GateResult,
+    ReproductionResult,
     RunEvent,
     Spec,
     TestCase,
@@ -152,10 +153,39 @@ class LivePlaybook:
     def set_elements(self, elements: Sequence[ElementCatalogEntry]) -> None:
         self.elements = elements
 
+    # Slow (typing 1k-10k characters, network emulation) or always-inconclusive
+    # checks are skipped in live runs; they stay available to offline benchmarks.
+    SKIPPED_IN_LIVE = {
+        "form-max-length-1024", "form-max-length-10000", "form-throttled-network",
+        "form-offline-toggle", "security-idor",
+        # Tabs a fixed count and presses Enter with other required fields empty, so a
+        # correctly validating form "fails"; a reproducible false positive.
+        "form-keyboard-submit",
+    }
+    # Page-level checks first: one run each, and they find the most real bugs.
+    PRIORITY = (
+        "list-broken-images", "list-broken-links", "list-console-errors", "list-accessible-names",
+        "security-logged-out-protected", "list-pagination-boundary", "list-zero-result-filter",
+        "form-empty-required", "form-xss-payload", "security-reflected-xss", "form-double-submit",
+        "form-password-masking", "form-max-length",
+    )
+
     def generate(self, spec: Spec) -> list[TestCase]:
+        from argus.config import settings
         from argus.spec.playbook import generate
 
-        return generate(spec, self.elements)
+        per_check: dict[str, list[TestCase]] = {}
+        for case in generate(spec, self.elements):
+            check_id = case.id.removeprefix("playbook-").rsplit("-element-", 1)[0]
+            if check_id in self.SKIPPED_IN_LIVE:
+                continue
+            bucket = per_check.setdefault(check_id, [])
+            if len(bucket) < settings.playbook_max_targets_per_check:
+                bucket.append(case)
+        rank = {check_id: index for index, check_id in enumerate(self.PRIORITY)}
+        ordered = sorted(per_check, key=lambda check_id: (rank.get(check_id, len(rank)), check_id))
+        cases = [case for check_id in ordered for case in per_check[check_id]]
+        return cases[:settings.playbook_max_cases]
 
 
 class LiveBinder:
@@ -180,11 +210,14 @@ class LiveTester:
         *,
         on_screencast_frame: Callable[[dict], None] | None = None,
         on_action: Callable[[dict], None] | None = None,
+        finding_cases: dict[str, TestCase] | None = None,
     ) -> None:
         self.layout = layout
         self.on_screencast_frame = on_screencast_frame
         self.on_action = on_action
         self.binding_results: dict[str, dict] = {}
+        # finding id -> the test case that produced it, so the gate can replay it.
+        self.finding_cases: dict[str, TestCase] = finding_cases if finding_cases is not None else {}
 
     def set_binding_results(self, results: list[dict]) -> None:
         self.binding_results = {item["test_case"]["id"]: item for item in results}
@@ -193,59 +226,85 @@ class LiveTester:
         from argus.agents.tester import execute_case
         from argus.browser.session import BrowserSessionFactory
         from argus.config import settings
+        from argus.oracles import Execution, evaluate
+
+        self.emitted_finding_ids: set[str] = set()
+        viewer = {"busy": False}
+
+        def emit(event_type: str, correlation_id: str, payload: dict) -> None:
+            self.layout.append_event(RunEvent(
+                id=uuid4().hex, run_id=self.layout.run_dir.name, agent="tester",
+                correlation_id=correlation_id, type=event_type, payload=payload,
+            ))
+
+        async def run_case(case: TestCase, factory, semaphore: asyncio.Semaphore) -> TestResult:
+            binding = self.binding_results.get(case.id)
+            if binding and binding["verdict"] == "INCONCLUSIVE":
+                evidence = Evidence(
+                    steps=case.steps,
+                    expected=case.expected,
+                    actual=binding.get("reason") or "Semantic binding was inconclusive.",
+                )
+                return TestResult(test_id=case.id, verdict="INCONCLUSIVE", evidence=evidence, duration_ms=0)
+            async with semaphore:
+                from argus.cancellation import is_cancelled
+
+                if is_cancelled(self.layout.run_dir.name):
+                    return TestResult(test_id=case.id, verdict="INCONCLUSIVE", duration_ms=0, evidence=Evidence(
+                        steps=case.steps, expected=case.expected, actual="Run stopped by user."))
+                # Only one case at a time owns the live view (screencast + cursor),
+                # paced so a viewer can follow it; the rest run headless in parallel.
+                foreground = not viewer["busy"] and self.on_screencast_frame is not None
+                if foreground:
+                    viewer["busy"] = True
+                session, cdp_session = await factory.new_context(
+                    settings.browser,
+                    record={"trace": True},
+                    artifact_id="case-" + re.sub(r"[^A-Za-z0-9._-]", "_", case.id)[:100],
+                )
+                screencast = (
+                    CdpScreencastCapture(cdp_session, self.on_screencast_frame, page=session.page)
+                    if foreground and cdp_session is not None else None
+                )
+                try:
+                    if screencast is not None:
+                        await screencast.start()
+                    verdict, evidence, duration = await execute_case(
+                        session,
+                        case,
+                        self.layout,
+                        initial_url=target_url,
+                        on_action=self.on_action if foreground else None,
+                        step_delay_ms=settings.demo_step_delay_ms if foreground else 0,
+                    )
+                finally:
+                    if screencast is not None:
+                        await screencast.stop()
+                    await session.close()
+                    if foreground:
+                        viewer["busy"] = False
+            return TestResult(test_id=case.id, verdict=verdict, evidence=evidence, duration_ms=duration)
 
         async def execute() -> list[TestResult]:
-            output: list[TestResult] = []
+            semaphore = asyncio.Semaphore(settings.test_concurrency)
             async with BrowserSessionFactory(artifact_dir=self.layout.artifacts_dir) as factory:
-                for case in test_cases:
-                    binding = self.binding_results.get(case.id)
-                    if binding and binding["verdict"] == "INCONCLUSIVE":
-                        evidence = Evidence(
-                            steps=case.steps,
-                            expected=case.expected,
-                            actual=binding.get("reason") or "Semantic binding was inconclusive.",
-                        )
-                        result = TestResult(test_id=case.id, verdict="INCONCLUSIVE", evidence=evidence, duration_ms=0)
-                    else:
-                        session, cdp_session = await factory.new_context(
-                            settings.browser,
-                            record={"trace": True},
-                            artifact_id="case-" + re.sub(r"[^A-Za-z0-9._-]", "_", case.id)[:100],
-                        )
-                        screencast = (
-                            CdpScreencastCapture(
-                                cdp_session, self.on_screencast_frame, page=session.page,
-                            )
-                            if cdp_session is not None and self.on_screencast_frame is not None
-                            else None
-                        )
-                        try:
-                            if screencast is not None:
-                                await screencast.start()
-                            verdict, evidence, duration = await execute_case(
-                                session,
-                                case,
-                                self.layout,
-                                initial_url=target_url,
-                                on_action=self.on_action,
-                            )
-                        finally:
-                            if screencast is not None:
-                                await screencast.stop()
-                            await session.close()
-                        result = TestResult(
-                            test_id=case.id, verdict=verdict, evidence=evidence, duration_ms=duration,
-                        )
-                    output.append(result)
-                    self.layout.append_event(RunEvent(
-                        id=uuid4().hex,
-                        run_id=self.layout.run_dir.name,
-                        agent="tester",
-                        correlation_id=case.id,
-                        type="test_result",
-                        payload={"test_id": case.id, "verdict": result.verdict, "duration_ms": result.duration_ms},
-                    ))
-            return output
+
+                async def run_and_report(case: TestCase) -> TestResult:
+                    result = await run_case(case, factory, semaphore)
+                    emit("test_result", case.id,
+                         {"test_id": case.id, "verdict": result.verdict, "duration_ms": result.duration_ms})
+                    # Stream findings as soon as a case finishes instead of after the
+                    # whole test phase; IDs are deterministic, so the oracle phase
+                    # later skips re-emitting them.
+                    for finding in evaluate(Execution(test_case=case, result=result, target_url=target_url)):
+                        finding = finding.model_copy(update={"steps": case.steps})
+                        self.finding_cases.setdefault(finding.id, case)
+                        if finding.id not in self.emitted_finding_ids:
+                            self.emitted_finding_ids.add(finding.id)
+                            emit("finding_created", case.id, finding.model_dump(mode="json"))
+                    return result
+
+                return list(await asyncio.gather(*(run_and_report(case) for case in test_cases)))
 
         return asyncio.run(execute())
 
@@ -268,10 +327,16 @@ class LiveOracle:
 
 
 class LiveGate:
-    def __init__(self, target_url: str, layout: RunArtifactLayout) -> None:
+    def __init__(self, target_url: str, layout: RunArtifactLayout,
+                 finding_cases: dict[str, TestCase] | None = None, *,
+                 on_screencast_frame: Callable[[dict], None] | None = None,
+                 on_action: Callable[[dict], None] | None = None) -> None:
         self.target_url = target_url
         self.layout = layout
+        self.on_screencast_frame = on_screencast_frame
+        self.on_action = on_action
         self.reproduction = {}
+        self.finding_cases = finding_cases
 
     def evaluate(self, finding: Finding, evidence: Evidence) -> GateResult:
         from argus.agents.evidence_gate import gate_findings
@@ -291,6 +356,120 @@ class LiveGate:
         decision = decisions[0]
         self.reproduction[finding.id] = decision.reproduction
         return decision.result
+
+    REPLAY_ATTEMPTS = 3
+
+    def evaluate_many(self, findings: Sequence[Finding]) -> list[GateResult]:
+        """Replay each distinct symptom by re-running the test case that found it.
+
+        A replay counts as a reproduction when the same oracles, run on the fresh
+        result, raise a finding with the identical symptom signature. Duplicate
+        symptoms share one set of replays; every finding still gets a result.
+        """
+        from argus.agents.tester import execute_case
+        from argus.browser.session import BrowserSessionFactory
+        from argus.cancellation import is_cancelled
+        from argus.config import settings
+        from argus.oracles import Execution, evaluate
+
+        groups: dict[str, list[Finding]] = {}
+        for finding in findings:
+            # The oracle phase lists a finding once per result that raised it.
+            group = groups.setdefault(finding.symptom_signature, [])
+            if all(item.id != finding.id for item in group):
+                group.append(finding)
+        case_for = self.finding_cases or {}
+        attempts = self.REPLAY_ATTEMPTS
+        threshold = 2 / 3
+
+        viewer = {"busy": False}
+
+        async def gate_all() -> list[tuple[list[Finding], int, int]]:
+            semaphore = asyncio.Semaphore(settings.test_concurrency)
+            async with BrowserSessionFactory(artifact_dir=self.layout.artifacts_dir) as factory:
+                async def replay_group(group: list[Finding]) -> tuple[list[Finding], int, int]:
+                    representative = group[0]
+                    case = next((case_for[item.id] for item in group if item.id in case_for), None)
+                    if case is None:
+                        return group, 0, 0
+                    successes = completed = 0
+                    async with semaphore:
+                        for attempt in range(attempts):
+                            if is_cancelled(self.layout.run_dir.name):
+                                break
+                            # Stop once the verdict cannot change: 2 reproductions
+                            # accept, 2 misses reject (or leave it flaky).
+                            if successes >= 2 or completed - successes >= 2:
+                                break
+                            session, cdp_session = await factory.new_context(
+                                settings.browser,
+                                artifact_id=f"gate-{representative.id[:32]}-{attempt + 1}",
+                            )
+                            # One replay at a time is shown in the live view so the
+                            # verification phase is visibly working, not frozen.
+                            foreground = (not viewer["busy"] and cdp_session is not None
+                                          and self.on_screencast_frame is not None)
+                            screencast = None
+                            if foreground:
+                                viewer["busy"] = True
+                                screencast = CdpScreencastCapture(cdp_session, self.on_screencast_frame,
+                                                                  page=session.page)
+                            try:
+                                if screencast is not None:
+                                    await screencast.start()
+                                verdict, evidence, duration = await execute_case(
+                                    session, case, self.layout, initial_url=self.target_url,
+                                    on_action=self.on_action if foreground else None,
+                                )
+                            finally:
+                                if screencast is not None:
+                                    await screencast.stop()
+                                await session.close()
+                                if foreground:
+                                    viewer["busy"] = False
+                            completed += 1
+                            result = TestResult(test_id=case.id, verdict=verdict, evidence=evidence,
+                                                duration_ms=duration)
+                            replayed = evaluate(Execution(test_case=case, result=result,
+                                                          target_url=self.target_url))
+                            if any(item.symptom_signature == representative.symptom_signature
+                                   for item in replayed):
+                                successes += 1
+                    publish(group, completed, successes)
+                    return group, completed, successes
+
+                return await asyncio.gather(*(replay_group(group) for group in groups.values()))
+
+        def decide(completed: int, successes: int) -> str:
+            if successes >= 2:
+                return "ACCEPTED"
+            if completed - successes >= 2:
+                return "REJECTED" if successes == 0 else "FLAKY"
+            return "FLAKY"  # Not enough observations to decide either way.
+
+        def gate_results(group: list[Finding], completed: int, successes: int) -> list[GateResult]:
+            return [GateResult(finding_id=finding.id, verdict=decide(completed, successes),
+                               attempts=completed, successes=successes, threshold=threshold)
+                    for finding in group]
+
+        def publish(group: list[Finding], completed: int, successes: int) -> None:
+            # Stream verdicts as each symptom finishes so the UI never sits on "Verifying…".
+            for result in gate_results(group, completed, successes):
+                self.layout.append_event(RunEvent(
+                    id=uuid4().hex, run_id=self.layout.run_dir.name, agent="gate",
+                    correlation_id=result.finding_id, type="gate_result",
+                    payload=result.model_dump(mode="json"),
+                ))
+            self.published_live = True
+
+        results: list[GateResult] = []
+        for group, completed, successes in asyncio.run(gate_all()):
+            reproduction = ReproductionResult(attempts=completed, successes=successes,
+                                              contexts=["fresh"] * completed)
+            for finding in group:
+                self.reproduction[finding.id] = reproduction
+            results.extend(gate_results(group, completed, successes))
+        return results
 
 
 class LiveRedTeam:
@@ -319,11 +498,18 @@ class LiveReporter:
                 evidence = evidence_by_finding.get(finding.id)
                 if not gate or not verification or evidence is None:
                     continue
-                if gate.verdict != "ACCEPTED" or verification.verdict != "CONFIRMED":
+                if gate.verdict != "ACCEPTED" or verification.verdict == "REFUTED":
                     continue
-                document = await build_report(
-                    finding, evidence, gate=gate, verification=verification,
-                )
+                # The report's numbered steps must be the ones actually executed
+                # (test-data placeholders filled in), i.e. the evidence's steps.
+                finding = finding.model_copy(update={"steps": list(evidence.steps)})
+                try:
+                    document = await build_report(
+                        finding, evidence, gate=gate, verification=verification,
+                    )
+                except Exception:  # noqa: BLE001 - one malformed finding must not drop every report
+                    logger.exception("Skipping report for %s", finding.id)
+                    continue
                 reports.append(document.report)
             return reports
 
@@ -331,10 +517,15 @@ class LiveReporter:
 
 
 class LiveExporter:
+    def __init__(self, target_url: str = "") -> None:
+        self.target_url = target_url
+
     def export(self, test_cases: Sequence[TestCase], destination: Path) -> list[Path]:
+        # The supervisor passes only passing journeys: the reusable suite must be green.
         from argus.reporter.playwright_export import export_test
 
-        return [export_test(case, destination / f"{case.id}.spec.ts") for case in test_cases]
+        return [export_test(case, destination / f"{case.id}.spec.ts", base_url=self.target_url or None)
+                for case in test_cases]
 
 
 def build_live_components(
@@ -350,6 +541,8 @@ def build_live_components(
     from argus.stubs import GoldenFixtures, build_demo_registry
 
     gateway = ModelGateway()
+    # Shared between tester (writer) and gate (reader) so findings replay their own case.
+    finding_cases: dict[str, TestCase] = {}
     fixtures = GoldenFixtures()
     registry = build_demo_registry(fixtures, layout)
     factories = {
@@ -371,12 +564,17 @@ def build_live_components(
             layout,
             on_screencast_frame=on_screencast_frame,
             on_action=on_action,
+            finding_cases=finding_cases,
         ),
         "oracle": lambda: LiveOracle(target_url),
-        "gate": lambda: LiveGate(target_url, layout),
+        "gate": lambda: LiveGate(
+            target_url, layout, finding_cases,
+            on_screencast_frame=on_screencast_frame,
+            on_action=on_action,
+        ),
         "red_team": LiveRedTeam,
         "reporter": LiveReporter,
-        "exporter": LiveExporter,
+        "exporter": lambda: LiveExporter(target_url),
         "event_bus": lambda: LiveEventBus(layout),
     }
     for role, factory in factories.items():
