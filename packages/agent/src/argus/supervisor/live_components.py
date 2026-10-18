@@ -7,6 +7,7 @@ import logging
 import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import ClassVar
 from uuid import uuid4
 
 from argus_contracts.artifacts import RunArtifactLayout
@@ -64,8 +65,9 @@ class LiveSpecParser:
             if not (self.target_url and self.layout and self.on_screencast_frame):
                 return await spec_task
 
-            from argus.browser.session import BrowserSessionFactory
             from playwright.async_api import Error as PlaywrightError
+
+            from argus.browser.session import BrowserSessionFactory
 
             factory = BrowserSessionFactory(artifact_dir=self.layout.artifacts_dir)
             session = None
@@ -155,15 +157,15 @@ class LivePlaybook:
 
     # Slow (typing 1k-10k characters, network emulation) or always-inconclusive
     # checks are skipped in live runs; they stay available to offline benchmarks.
-    SKIPPED_IN_LIVE = {
+    SKIPPED_IN_LIVE: ClassVar[frozenset[str]] = frozenset({
         "form-max-length-1024", "form-max-length-10000", "form-throttled-network",
         "form-offline-toggle", "security-idor",
         # Tabs a fixed count and presses Enter with other required fields empty, so a
         # correctly validating form "fails"; a reproducible false positive.
         "form-keyboard-submit",
-    }
+    })
     # Page-level checks first: one run each, and they find the most real bugs.
-    PRIORITY = (
+    PRIORITY: ClassVar[tuple[str, ...]] = (
         "list-broken-images", "list-broken-links", "list-console-errors", "list-accessible-names",
         "security-logged-out-protected", "list-pagination-boundary", "list-zero-result-filter",
         "form-empty-required", "form-xss-payload", "security-reflected-xss", "form-double-submit",
@@ -507,7 +509,7 @@ class LiveReporter:
                     document = await build_report(
                         finding, evidence, gate=gate, verification=verification,
                     )
-                except Exception:  # noqa: BLE001 - one malformed finding must not drop every report
+                except Exception:
                     logger.exception("Skipping report for %s", finding.id)
                     continue
                 reports.append(document.report)

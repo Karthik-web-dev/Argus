@@ -117,7 +117,7 @@ def human_title(oracle_id: str, actual: str, steps: list[Step] | None = None) ->
         method, endpoint, status = match.groups()
         path = "/" + endpoint.split("/", 1)[1] if "/" in endpoint else endpoint
         filename = path.rstrip("/").rsplit("/", 1)[-1]
-        if method == "GET" and re.search(r"\.(png|jpe?g|gif|svg|webp|ico|css|js|woff2?)$", filename, re.I):
+        if method == "GET" and re.search(r"\.(png|jpe?g|gif|svg|webp|ico|css|js|woff2?)$", filename, re.IGNORECASE):
             return f"A file is missing (HTTP {status}): {filename}"
         kind = "Server error" if status.startswith("5") else "Request rejected"
         doing = {"GET": "loading", "POST": "submitting to", "PUT": "saving to",
@@ -163,7 +163,7 @@ def human_title(oracle_id: str, actual: str, steps: list[Step] | None = None) ->
     return "Application defect"
 
 
-_CORE_PATH = re.compile(r"order|checkout|cart|basket|payment|pay|login|log-in|sign|session|auth|register|ticket", re.I)
+_CORE_PATH = re.compile(r"order|checkout|cart|basket|payment|pay\b|login|log-in|sign|session|auth|register|ticket", re.IGNORECASE)
 
 
 def infer_severity(oracle_id: str, actual: str) -> str | None:

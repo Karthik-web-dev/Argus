@@ -409,7 +409,7 @@ def run_supervisor(
 
         write_report_documents(list(state.bugs_found), layout.reports_dir,
                                target_url=target_url, run_id=run_id)
-    except Exception:  # noqa: BLE001 - the shareable PDF must never fail a finished run
+    except Exception:
         logging.getLogger(__name__).exception("Could not render the bug report document")
     components["event_bus"].emit(RunEvent(
         id=uuid4().hex, run_id=run_id, agent="supervisor", correlation_id=run_id,

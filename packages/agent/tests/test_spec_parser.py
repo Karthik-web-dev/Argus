@@ -98,7 +98,8 @@ def test_conduit_spec_has_six_journeys_stable_claim_links_and_cassette_replay(tm
         schema = provider.requests[0]["schema"]
         assert schema["properties"]["journeys"]["minItems"] == 6
         assert "assert_idor_isolation" not in json.dumps(schema)
-        assert provider.requests[0]["max_tokens"] == 3500
+        # Conduit requests 5000 tokens; the per-call cap (4096 above) bounds it.
+        assert provider.requests[0]["max_tokens"] == 4096
         assert provider.calls == 1
 
         replay_provider = FakeProvider([])

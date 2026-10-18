@@ -15,7 +15,12 @@ from pathlib import Path
 
 from argus_contracts.models import BugReport
 
-from argus.reporter.plain_language import describe_step, human_title, infer_severity, is_unreadable_title
+from argus.reporter.plain_language import (
+    describe_step,
+    human_title,
+    infer_severity,
+    is_unreadable_title,
+)
 
 _SEVERITY_COLORS = {"P0": "#b42318", "P1": "#c4320a", "P2": "#b54708", "P3": "#475467"}
 

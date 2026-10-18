@@ -11,12 +11,11 @@ from uuid import uuid4
 from argus_contracts.artifacts import RunArtifactLayout
 from argus_contracts.models import Evidence, RunEvent
 from playwright.async_api import CDPSession, Page
-
-from argus.cancellation import is_cancelled
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from argus.browser.session import BrowserSession
+from argus.cancellation import is_cancelled
 from argus.evidence.recorder import EvidenceRecorder
 from argus.perception.a11y import resolve_semantic_locator
 from argus.spec.data_factory import TestDataFactory
